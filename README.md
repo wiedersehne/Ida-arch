@@ -1,127 +1,222 @@
-# SME Agent Test Workflow
+# SME Agent Testing Framework Workflow
 
 ## Mermaid Workflow Diagram
 
 ```mermaid
 graph TD
-    A[Start SME Test Pipeline] --> B[Load Configuration]
-    B --> C[Initialize LLM Manager]
-    C --> D[Load Test Cases from JSON]
-    D --> E[Initialize Multi-Evaluator System]
+    A[Start SME Testing Framework] --> B[Phase 1: Build Dataset]
     
-    E --> F[General Quality Evaluator<br/>Weight: 30%]
-    E --> G[Technical Accuracy Evaluator<br/>Weight: 25%]
-    E --> H[RAG Evaluation Evaluator<br/>Weight: 20%]
-    E --> I[Semantic Analysis Evaluator<br/>Weight: 15%]
-    E --> J[Coherence Assessment Evaluator<br/>Weight: 10%]
+    B --> C[Create 100 Test Cases]
+    C --> D[RAG Cases: 35%<br/>File Cases: 35%<br/>General Cases: 20%<br/>Meta Cases: 10%]
     
-    F --> K[Create SME Agent Instance]
-    G --> K
-    H --> K
-    I --> K
-    J --> K
+    D --> E[For RAG/General/Meta Cases]
+    E --> F[Ask Ida Directly]
+    F --> G[Human-in-Loop Review]
+    G --> H[Modify Answers if Needed]
+    H --> I[Wrap in JSON Format]
     
-    K --> L[For Each Test Case]
-    L --> M[Extract Test Data]
-    M --> N[Query: question]
-    M --> O[Expected Answer]
-    M --> P[Expected Route]
-    M --> Q[Context]
+    D --> J[For File Cases]
+    J --> K[Upload Specific File<br/>e.g., NNM101.pdf]
+    K --> L[Ask Ida File-Related Questions]
+    L --> M[Human-in-Loop Review]
+    M --> N[Modify Answers if Needed]
+    N --> O[Wrap in JSON Format]
     
-    N --> R[Test Routing Decision]
-    R --> S[Get Actual Route]
-    S --> T[Generate Mock Response]
+    I --> P[Phase 2: Design Metrics]
+    O --> P
     
-    T --> U[Multi-Evaluator Assessment]
-    U --> V[General Quality Evaluation]
-    U --> W[Technical Accuracy Evaluation]
-    U --> X[RAG Evaluation]
-    U --> Y[Semantic Analysis]
-    U --> Z[Coherence Assessment]
+    P --> Q[Agent Functionality Metrics]
+    Q --> R[Context Precision RAG]
+    Q --> S[Context Recall RAG]
+    Q --> T[Faithfulness RAG/File]
+    Q --> U[Semantic Similarity All]
+    Q --> V[Answer Correctness All]
+    Q --> W[Answer Completeness All]
+    Q --> X[Answer Relevancy All]
+    Q --> Y[Overall Score Weighted]
     
-    V --> AA[Weighted Aggregation]
-    W --> AA
-    X --> AA
-    Y --> AA
-    Z --> AA
+    P --> Z[Agent Routing Metrics]
+    Z --> AA[Routing Accuracy<br/>Correct Routes / Total Routes]
     
-    AA --> BB[Calculate Final Metrics]
-    BB --> CC[Determine Pass/Fail]
-    CC --> DD[Store Test Result]
+    Y --> BB[Phase 3: Design Evaluators]
+    AA --> BB
     
-    DD --> EE{More Test Cases?}
-    EE -->|Yes| L
-    EE -->|No| FF[Generate Comprehensive Report]
+    BB --> CC[Multi-LLM Evaluator System]
+    CC --> DD[General Quality Evaluator<br/>Weight: 30%]
+    CC --> EE[Technical Accuracy Evaluator<br/>Weight: 25%]
+    CC --> FF[RAG Evaluation Evaluator<br/>Weight: 20%]
+    CC --> GG[Semantic Analysis Evaluator<br/>Weight: 15%]
+    CC --> HH[Coherence Assessment Evaluator<br/>Weight: 10%]
     
-    FF --> GG[Calculate Statistics]
-    GG --> HH[Route Breakdown Analysis]
-    HH --> II[Individual Evaluator Results]
-    II --> JJ[Consensus Analysis]
-    JJ --> KK[Performance Metrics]
+    DD --> II[Phase 4: Build Automatic Test Workflow]
+    EE --> II
+    FF --> II
+    GG --> II
+    HH --> II
     
-    KK --> LL[Save Results to JSON]
-    LL --> MM[Print Formatted Report]
-    MM --> NN[End Test Pipeline]
+    II --> JJ[Load Test Cases from JSON]
+    JJ --> KK[Create SME Agent Instance]
+    KK --> LL[Initialize Answer Comparison Service]
+    
+    LL --> MM[For Each Test Case Loop]
+    MM --> NN[Extract Test Data]
+    NN --> OO[Query Question]
+    NN --> PP[Expected Answer]
+    NN --> QQ[Expected Route]
+    NN --> RR[Context Information]
+    
+    OO --> SS[Test Routing Decision]
+    SS --> TT[Get Actual Route]
+    TT --> UU[Generate Response]
+    
+    UU --> VV[Multi-Evaluator Assessment]
+    VV --> WW[General Quality Evaluation<br/>Correctness, Completeness, Relevancy]
+    VV --> XX[Technical Accuracy Evaluation<br/>Domain Knowledge, Terminology]
+    VV --> YY[RAG Evaluation<br/>Context Precision, Recall, Faithfulness]
+    VV --> ZZ[Semantic Analysis<br/>Similarity, Meaning Preservation]
+    VV --> AAA[Coherence Assessment<br/>Flow, Clarity, Organization]
+    
+    WW --> BBB[Weighted Aggregation]
+    XX --> BBB
+    YY --> BBB
+    ZZ --> BBB
+    AAA --> BBB
+    
+    BBB --> CCC[Calculate Final Metrics]
+    CCC --> DDD[Determine Pass/Fail]
+    DDD --> EEE[Store Test Result]
+    
+    EEE --> FFF{More Test Cases?}
+    FFF -->|Yes| MM
+    FFF -->|No| GGG[Generate Comprehensive Report]
+    
+    GGG --> HHH[Calculate Statistics]
+    HHH --> III[Route Accuracy Analysis]
+    HHH --> JJJ[Answer Quality Analysis]
+    HHH --> KKK[Individual Evaluator Results]
+    HHH --> LLL[Consensus Analysis]
+    HHH --> MMM[Performance Metrics]
+    
+    III --> NNN[Save Results to JSON]
+    JJJ --> NNN
+    KKK --> NNN
+    LLL --> NNN
+    MMM --> NNN
+    
+    NNN --> OOO[Print Formatted Report]
+    OOO --> PPP[Phase 5: Further Improvement]
+    
+    PPP --> QQQ[Continuous Enhancement Strategies]
+    QQQ --> RRR[End Testing Framework]
     
     %% Styling
-    classDef startEnd fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-    classDef process fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-    classDef evaluator fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
-    classDef decision fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    classDef report fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    classDef startEnd fill:#e1f5fe,stroke:#01579b,stroke-width:3px
+    classDef phase fill:#f3e5f5,stroke:#4a148c,stroke-width:3px
+    classDef dataset fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
+    classDef metrics fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef evaluator fill:#e3f2fd,stroke:#0277bd,stroke-width:2px
+    classDef workflow fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    classDef decision fill:#fff8e1,stroke:#f57c00,stroke-width:2px
+    classDef report fill:#f1f8e9,stroke:#33691e,stroke-width:2px
     
-    class A,NN startEnd
-    class B,C,D,K,L,M,N,O,P,Q,R,S,T,AA,BB,CC,DD,FF,GG,HH,II,JJ,KK,LL,MM process
-    class F,G,H,I,J,V,W,X,Y,Z evaluator
-    class EE decision
-    class FF,GG,HH,II,JJ,KK,LL,MM report
+    class A,RRR startEnd
+    class B,P,BB,II,PPP phase
+    class C,D,E,F,G,H,I,J,K,L,M,N,O dataset
+    class Q,R,S,T,U,V,W,X,Y,Z,AA metrics
+    class CC,DD,EE,FF,GG,HH,WW,XX,YY,ZZ,AAA evaluator
+    class FFF decision
+    class GGG,HHH,III,JJJ,KKK,LLL,MMM,NNN,OOO,QQQ report
 ```
 
 ## Detailed Workflow Description
 
-### Phase 1: Initialization
-1. **Start SME Test Pipeline**: Begin automated testing process
-2. **Load Configuration**: Load LLM and evaluation settings from config.yaml
-3. **Initialize LLM Manager**: Set up Azure OpenAI connections
-4. **Load Test Cases**: Read predefined Q&A pairs from JSON file
-5. **Initialize Multi-Evaluator System**: Set up 5 specialized evaluators
+### Phase 1: Build Dataset (100 Test Cases)
+**Purpose**: Create comprehensive test dataset covering all SME agent capabilities
 
-### Phase 2: Evaluator Setup
-- **General Quality Evaluator** (30% weight): Assesses correctness, completeness, relevancy, coherence
-- **Technical Accuracy Evaluator** (25% weight): Validates oil & gas domain knowledge
-- **RAG Evaluation Evaluator** (20% weight): Measures context precision, recall, faithfulness
-- **Semantic Analysis Evaluator** (15% weight): Analyzes meaning similarity and concept alignment
-- **Coherence Assessment Evaluator** (10% weight): Evaluates structure and readability
+**Test Case Distribution**:
+- **RAG Cases (35%)**: Domain knowledge questions requiring retrieval from knowledge base
+- **File Cases (35%)**: Questions about uploaded documents requiring file interpretation
+- **General Cases (20%)**: General knowledge questions not requiring domain expertise
+- **Meta Cases (10%)**: Questions about Ida's identity, capabilities, and role
 
-### Phase 3: Test Execution
-1. **Create SME Agent**: Initialize agent with mocked dependencies
-2. **For Each Test Case**: Iterate through all test cases
-3. **Extract Test Data**: Parse question, expected answer, route, and context
-4. **Test Routing**: Determine which route the agent would take
-5. **Generate Response**: Create mock response based on routing decision
-6. **Multi-Evaluator Assessment**: Run all 5 evaluators in parallel
+**Dataset Creation Process**:
+1. **For RAG/General/Meta Cases**:
+   - Ask Ida directly to get initial answers
+   - Human-in-loop review and validation
+   - Modify answers if needed for accuracy
+   - Wrap in standardized JSON format
 
-### Phase 4: Evaluation & Aggregation
-1. **Individual Evaluations**: Each evaluator provides specialized assessment
-2. **Weighted Aggregation**: Combine results using configurable weights
-3. **Calculate Final Metrics**: Compute overall scores and confidence levels
-4. **Determine Pass/Fail**: Apply thresholds to determine test success
-5. **Store Results**: Save individual test results
+2. **For File Cases**:
+   - Upload specific files (e.g., NNM101.pdf)
+   - Ask Ida file-related questions
+   - Human-in-loop review and validation
+   - Modify answers if needed for accuracy
+   - Wrap in standardized JSON format
 
-### Phase 5: Reporting
-1. **Generate Comprehensive Report**: Create detailed analysis
-2. **Calculate Statistics**: Compute averages, success rates, trends
-3. **Route Breakdown**: Analyze performance by routing category
-4. **Individual Evaluator Results**: Show detailed evaluator assessments
-5. **Consensus Analysis**: Measure agreement between evaluators
-6. **Performance Metrics**: Track execution times and efficiency
-7. **Save & Display**: Export to JSON and print formatted report
+### Phase 2: Design Metrics
+**Purpose**: Define comprehensive evaluation criteria for both functionality and routing
+
+**Agent Functionality Metrics**:
+- **Context Precision (RAG)**: Relevance of retrieved context chunks
+- **Context Recall (RAG)**: Completeness of context retrieval
+- **Faithfulness (RAG/File)**: Grounding in provided context without hallucination
+- **Semantic Similarity (All)**: Cosine similarity between generated and expected answers
+- **Answer Correctness (All)**: Factual accuracy and correctness
+- **Answer Completeness (All)**: Thoroughness in addressing all question aspects
+- **Answer Relevancy (All)**: Directness in addressing the specific question
+- **Overall Score**: Weighted average of all metrics
+
+**Agent Routing Metrics**:
+- **Routing Accuracy**: Correct routing decisions / Total routing decisions
+
+### Phase 3: Design Evaluators
+**Purpose**: Implement multi-LLM evaluation system with specialized evaluators
+
+**Multi-LLM Evaluator System**:
+- **General Quality Evaluator** (30% weight): Correctness, completeness, relevancy, coherence
+- **Technical Accuracy Evaluator** (25% weight): Oil & gas domain knowledge and terminology
+- **RAG Evaluation Evaluator** (20% weight): Context precision, recall, faithfulness
+- **Semantic Analysis Evaluator** (15% weight): Meaning similarity and concept alignment
+- **Coherence Assessment Evaluator** (10% weight): Structure, clarity, organization
+
+**Key Features**:
+- Each evaluator uses specialized LLM models
+- Weighted aggregation of results
+- Confidence scoring for each evaluation
+- Detailed reasoning for audit trail
+
+### Phase 4: Build Automatic Test Workflow
+**Purpose**: Implement automated testing pipeline with comprehensive evaluation
+
+**Test Execution Process**:
+1. **Load Test Cases**: Read 100 test cases from JSON
+2. **Create SME Agent**: Initialize agent with mocked dependencies
+3. **Initialize Answer Comparison Service**: Set up multi-evaluator system
+4. **For Each Test Case**:
+   - Extract test data (question, expected answer, route, context)
+   - Test routing decision accuracy
+   - Generate response
+   - Run multi-evaluator assessment
+   - Calculate weighted metrics
+   - Determine pass/fail status
+   - Store results
+
+### Phase 5: Further Improvement
+**Purpose**: Continuous enhancement based on test results
+
+**Enhancement Strategies**:
+- Analyze test results for patterns and weaknesses
+- Refine evaluator weights based on performance
+- Update test cases based on new requirements
+- Improve SME agent based on identified issues
+- Iterate on evaluation criteria and thresholds
 
 ## Key Features
 
-- **Parallel Processing**: Multiple evaluators run simultaneously
-- **Weighted Scoring**: Configurable importance for different evaluation aspects
-- **Comprehensive Metrics**: 10+ evaluation dimensions
-- **Robust Error Handling**: Fallback mechanisms for evaluator failures
-- **Detailed Reporting**: Complete audit trail and analysis
-- **Scientific Rigor**: Statistically sound aggregation methods
+- **Comprehensive Coverage**: Tests all SME agent capabilities (RAG, File, General, Meta)
+- **Human-in-Loop Validation**: Ensures high-quality test dataset
+- **Multi-LLM Evaluation**: Specialized evaluators for different aspects
+- **Weighted Aggregation**: Scientifically sound result combination
+- **Detailed Reporting**: Complete analysis and audit trail
+- **Continuous Improvement**: Framework for ongoing enhancement
+- **Robust Error Handling**: Fallback mechanisms for reliability
