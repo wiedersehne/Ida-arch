@@ -1,131 +1,75 @@
-# SME Agent Testing Framework Workflow
+# Phase 4: Build Automatic Test Workflow
 
-## Mermaid Workflow Diagram
+## Mermaid Test Workflow Diagram
 
 ```mermaid
 graph TD
-    A[Start SME Testing Framework] --> B[Phase 1: Build Dataset]
+    A[Phase 4: Start Automatic Test Workflow] --> B[Load Test Cases from JSON]
+    B --> C[Create SME Agent Instance]
+    C --> D[Initialize Answer Comparison Service]
     
-    B --> C[Create 100 Test Cases]
-    C --> D[RAG Cases: 35%<br/>File Cases: 35%<br/>General Cases: 20%<br/>Meta Cases: 10%]
+    D --> E[For Each Test Case Loop]
+    E --> F[Extract Test Data]
+    F --> G[Query Question]
+    F --> H[Expected Answer]
+    F --> I[Expected Route]
+    F --> J[Context Information]
     
-    D --> E[For RAG/General/Meta Cases]
-    E --> F[Ask Ida Directly]
-    F --> G[Human-in-Loop Review]
-    G --> H[Modify Answers if Needed]
-    H --> I[Wrap in JSON Format]
+    G --> K[Test Routing Decision]
+    K --> L[Get Actual Route]
+    L --> M[Generate Response]
     
-    D --> J[For File Cases]
-    J --> K[Upload Specific File<br/>e.g., NNM101.pdf]
-    K --> L[Ask Ida File-Related Questions]
-    L --> M[Human-in-Loop Review]
-    M --> N[Modify Answers if Needed]
-    N --> O[Wrap in JSON Format]
+    M --> N[Multi-Evaluator Assessment]
+    N --> O[General Quality Evaluation<br/>Weight: 30%<br/>Correctness, Completeness, Relevancy]
+    N --> P[Technical Accuracy Evaluation<br/>Weight: 25%<br/>Domain Knowledge, Terminology]
+    N --> Q[RAG Evaluation<br/>Weight: 20%<br/>Context Precision, Recall, Faithfulness]
+    N --> R[Semantic Analysis<br/>Weight: 15%<br/>Similarity, Meaning Preservation]
+    N --> S[Coherence Assessment<br/>Weight: 10%<br/>Flow, Clarity, Organization]
     
-    I --> P[Phase 2: Design Metrics]
-    O --> P
+    O --> T[Weighted Aggregation<br/>Final Score Calculation]
+    P --> T
+    Q --> T
+    R --> T
+    S --> T
     
-    P --> Q[Agent Functionality Metrics]
-    Q --> R[Context Precision RAG]
-    Q --> S[Context Recall RAG]
-    Q --> T[Faithfulness RAG/File]
-    Q --> U[Semantic Similarity All]
-    Q --> V[Answer Correctness All]
-    Q --> W[Answer Completeness All]
-    Q --> X[Answer Relevancy All]
-    Q --> Y[Overall Score Weighted]
+    T --> U[Calculate Final Metrics]
+    U --> V[Determine Pass/Fail Status]
+    V --> W[Store Test Result]
     
-    P --> Z[Agent Routing Metrics]
-    Z --> AA[Routing Accuracy<br/>Correct Routes / Total Routes]
+    W --> X{More Test Cases?}
+    X -->|Yes| E
+    X -->|No| Y[Generate Comprehensive Report]
     
-    Y --> BB[Phase 3: Design Evaluators]
-    AA --> BB
+    Y --> Z[Calculate Statistics]
+    Z --> AA[Route Accuracy Analysis]
+    Z --> BB[Answer Quality Analysis]
+    Z --> CC[Individual Evaluator Results]
+    Z --> DD[Consensus Analysis]
+    Z --> EE[Performance Metrics]
     
-    BB --> CC[Multi-LLM Evaluator System]
-    CC --> DD[General Quality Evaluator<br/>Weight: 30%]
-    CC --> EE[Technical Accuracy Evaluator<br/>Weight: 25%]
-    CC --> FF[RAG Evaluation Evaluator<br/>Weight: 20%]
-    CC --> GG[Semantic Analysis Evaluator<br/>Weight: 15%]
-    CC --> HH[Coherence Assessment Evaluator<br/>Weight: 10%]
+    AA --> FF[Save Results to JSON]
+    BB --> FF
+    CC --> FF
+    DD --> FF
+    EE --> FF
     
-    DD --> II[Phase 4: Build Automatic Test Workflow]
-    EE --> II
-    FF --> II
-    GG --> II
-    HH --> II
-    
-    II --> JJ[Load Test Cases from JSON]
-    JJ --> KK[Create SME Agent Instance]
-    KK --> LL[Initialize Answer Comparison Service]
-    
-    LL --> MM[For Each Test Case Loop]
-    MM --> NN[Extract Test Data]
-    NN --> OO[Query Question]
-    NN --> PP[Expected Answer]
-    NN --> QQ[Expected Route]
-    NN --> RR[Context Information]
-    
-    OO --> SS[Test Routing Decision]
-    SS --> TT[Get Actual Route]
-    TT --> UU[Generate Response]
-    
-    UU --> VV[Multi-Evaluator Assessment]
-    VV --> WW[General Quality Evaluation<br/>Correctness, Completeness, Relevancy]
-    VV --> XX[Technical Accuracy Evaluation<br/>Domain Knowledge, Terminology]
-    VV --> YY[RAG Evaluation<br/>Context Precision, Recall, Faithfulness]
-    VV --> ZZ[Semantic Analysis<br/>Similarity, Meaning Preservation]
-    VV --> AAA[Coherence Assessment<br/>Flow, Clarity, Organization]
-    
-    WW --> BBB[Weighted Aggregation]
-    XX --> BBB
-    YY --> BBB
-    ZZ --> BBB
-    AAA --> BBB
-    
-    BBB --> CCC[Calculate Final Metrics]
-    CCC --> DDD[Determine Pass/Fail]
-    DDD --> EEE[Store Test Result]
-    
-    EEE --> FFF{More Test Cases?}
-    FFF -->|Yes| MM
-    FFF -->|No| GGG[Generate Comprehensive Report]
-    
-    GGG --> HHH[Calculate Statistics]
-    HHH --> III[Route Accuracy Analysis]
-    HHH --> JJJ[Answer Quality Analysis]
-    HHH --> KKK[Individual Evaluator Results]
-    HHH --> LLL[Consensus Analysis]
-    HHH --> MMM[Performance Metrics]
-    
-    III --> NNN[Save Results to JSON]
-    JJJ --> NNN
-    KKK --> NNN
-    LLL --> NNN
-    MMM --> NNN
-    
-    NNN --> OOO[Print Formatted Report]
-    OOO --> PPP[Phase 5: Further Improvement]
-    
-    PPP --> QQQ[Continuous Enhancement Strategies]
-    QQQ --> RRR[End Testing Framework]
+    FF --> GG[Print Formatted Report]
+    GG --> HH[End Phase 4: Test Workflow Complete]
     
     %% Styling
     classDef startEnd fill:#e1f5fe,stroke:#01579b,stroke-width:3px
-    classDef phase fill:#f3e5f5,stroke:#4a148c,stroke-width:3px
-    classDef dataset fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
-    classDef metrics fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    classDef evaluator fill:#e3f2fd,stroke:#0277bd,stroke-width:2px
-    classDef workflow fill:#fce4ec,stroke:#880e4f,stroke-width:2px
-    classDef decision fill:#fff8e1,stroke:#f57c00,stroke-width:2px
-    classDef report fill:#f1f8e9,stroke:#33691e,stroke-width:2px
+    classDef process fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef evaluator fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
+    classDef decision fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef report fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    classDef aggregation fill:#e3f2fd,stroke:#0277bd,stroke-width:2px
     
-    class A,RRR startEnd
-    class B,P,BB,II,PPP phase
-    class C,D,E,F,G,H,I,J,K,L,M,N,O dataset
-    class Q,R,S,T,U,V,W,X,Y,Z,AA metrics
-    class CC,DD,EE,FF,GG,HH,WW,XX,YY,ZZ,AAA evaluator
-    class FFF decision
-    class GGG,HHH,III,JJJ,KKK,LLL,MMM,NNN,OOO,QQQ report
+    class A,HH startEnd
+    class B,C,D,E,F,G,H,I,J,K,L,M,U,V,W process
+    class N,O,P,Q,R,S evaluator
+    class T aggregation
+    class X decision
+    class Y,Z,AA,BB,CC,DD,EE,FF,GG report
 ```
 
 ## Detailed Workflow Description
