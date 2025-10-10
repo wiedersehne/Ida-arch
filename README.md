@@ -4,72 +4,48 @@
 
 ```mermaid
 graph TD
-    A[Phase 4: Start Automatic Test Workflow] --> B[Load Test Cases from JSON]
-    B --> C[Create SME Agent Instance]
-    C --> D[Initialize Answer Comparison Service]
+    A[Start Test Pipeline] --> B[Load Test Cases]
+    B --> C[Create SME Agent]
+    C --> D[Initialize Evaluators]
     
-    D --> E[For Each Test Case Loop]
-    E --> F[Extract Test Data]
-    F --> G[Query Question]
-    F --> H[Expected Answer]
-    F --> I[Expected Route]
-    F --> J[Context Information]
+    D --> E[For Each Test Case]
+    E --> F[Test Routing Decision]
+    F --> G[Generate Response]
     
-    G --> K[Test Routing Decision]
-    K --> L[Get Actual Route]
-    L --> M[Generate Response]
+    G --> H[Multi-Evaluator Assessment]
+    H --> I[General Quality 30%]
+    H --> J[Technical Accuracy 25%]
+    H --> K[RAG Evaluation 20%]
+    H --> L[Semantic Analysis 15%]
+    H --> M[Coherence 10%]
     
-    M --> N[Multi-Evaluator Assessment]
-    N --> O[General Quality Evaluation<br/>Weight: 30%<br/>Correctness, Completeness, Relevancy]
-    N --> P[Technical Accuracy Evaluation<br/>Weight: 25%<br/>Domain Knowledge, Terminology]
-    N --> Q[RAG Evaluation<br/>Weight: 20%<br/>Context Precision, Recall, Faithfulness]
-    N --> R[Semantic Analysis<br/>Weight: 15%<br/>Similarity, Meaning Preservation]
-    N --> S[Coherence Assessment<br/>Weight: 10%<br/>Flow, Clarity, Organization]
+    I --> N[Weighted Aggregation]
+    J --> N
+    K --> N
+    L --> N
+    M --> N
     
-    O --> T[Weighted Aggregation<br/>Final Score Calculation]
-    P --> T
-    Q --> T
-    R --> T
-    S --> T
+    N --> O[Calculate Final Score]
+    O --> P[Store Result]
     
-    T --> U[Calculate Final Metrics]
-    U --> V[Determine Pass/Fail Status]
-    V --> W[Store Test Result]
+    P --> Q{More Tests?}
+    Q -->|Yes| E
+    Q -->|No| R[Generate Report]
     
-    W --> X{More Test Cases?}
-    X -->|Yes| E
-    X -->|No| Y[Generate Comprehensive Report]
-    
-    Y --> Z[Calculate Statistics]
-    Z --> AA[Route Accuracy Analysis]
-    Z --> BB[Answer Quality Analysis]
-    Z --> CC[Individual Evaluator Results]
-    Z --> DD[Consensus Analysis]
-    Z --> EE[Performance Metrics]
-    
-    AA --> FF[Save Results to JSON]
-    BB --> FF
-    CC --> FF
-    DD --> FF
-    EE --> FF
-    
-    FF --> GG[Print Formatted Report]
-    GG --> HH[End Phase 4: Test Workflow Complete]
+    R --> S[End Pipeline]
     
     %% Styling
     classDef startEnd fill:#e1f5fe,stroke:#01579b,stroke-width:3px
     classDef process fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
     classDef evaluator fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
     classDef decision fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    classDef report fill:#fce4ec,stroke:#880e4f,stroke-width:2px
     classDef aggregation fill:#e3f2fd,stroke:#0277bd,stroke-width:2px
     
-    class A,HH startEnd
-    class B,C,D,E,F,G,H,I,J,K,L,M,U,V,W process
-    class N,O,P,Q,R,S evaluator
-    class T aggregation
-    class X decision
-    class Y,Z,AA,BB,CC,DD,EE,FF,GG report
+    class A,S startEnd
+    class B,C,D,E,F,G,P,R process
+    class H,I,J,K,L,M evaluator
+    class N aggregation
+    class Q decision
 ```
 
 ## Detailed Workflow Description
