@@ -1,12 +1,12 @@
-# IDA Platform — Engineering Analysis
+# IDA Platform — Harness Engineering Analysis
 
-> A comprehensive engineering analysis of the Intelligent Drilling Assistant (IDA) platform, examining its architecture, technology stack, and implementation through the lens of core software engineering disciplines: **requirements & design**, **modularity & composition**, **data architecture**, **reliability & observability**, **security**, **deployment & operations**, and **testing & quality assurance**.
+> A harness-engineering analysis of the Intelligent Drilling Assistant (IDA) platform, examining the infrastructure that runs, controls, evaluates, and operationalizes model behavior. In this framing, the model is only one component. The main subject is the **execution harness** around it: **orchestration**, **step execution**, **input/output validation**, **tool integration**, **state management**, **retry/timeout behavior**, **logging/tracing**, and **evaluation/testing pipelines**.
 
 ---
 
-## 1. System Architecture Overview
+## 1. Harness Architecture Overview
 
-IDA is a **multi-agent LLM platform** for drilling engineering. It orchestrates specialist AI agents backed by Azure OpenAI models, a hybrid RAG knowledge engine, domain-specific simulators, and a reactive Vue 3 frontend — all deployed as a containerized monolith behind SSE-driven real-time messaging.
+IDA is a **multi-agent LLM platform** for drilling engineering, but from a harness-engineering perspective it is more specifically a **controlled execution environment** around model-backed workers. The platform makes those workers usable in production by supplying an orchestrator, bounded execution graphs, tool wrappers, validation layers, persistent state capture, retrieval controls, and streaming delivery paths. In practical terms, the value of the system comes from the fact that model behavior is wrapped in deterministic scaffolding rather than exposed raw.
 
 ```mermaid
 graph TB
@@ -65,9 +65,36 @@ graph TB
     SSE -.->|real-time| UI
 ```
 
+### 1.1 What Harness Engineering Means Here
+
+In this document, **harness engineering** means the engineering of the system around the model that makes LLM behavior operationally usable:
+
+- **Orchestration** — how workflows are decomposed, delegated, and sequenced
+- **Execution control** — how steps are run, retried, timed out, and terminated
+- **Validation** — how inputs and outputs are typed, parsed, and checked
+- **Tool integration** — how external capabilities are exposed through controlled wrappers
+- **State discipline** — what is persisted, streamed, filtered, or replayed
+- **Observability** — what is logged, traced, and measured during execution
+- **Evaluation hooks** — where quality, correctness, and regressions can be measured
+
+This is different from adjacent disciplines:
+
+| Area | Primary Focus |
+|------|---------------|
+| **Model engineering** | Training, fine-tuning, or serving base models |
+| **Prompt engineering** | Designing prompts and prompt templates |
+| **Harness engineering** | Running, controlling, evaluating, and integrating model-driven systems |
+
+Under that definition, IDA is best understood as a layered harness with four major concerns:
+
+1. **Interaction harness** — frontend, API, auth, SSE
+2. **Execution harness** — orchestrator, specialist agents, graph nodes, tools, skills
+3. **Knowledge harness** — retrieval, embeddings, vector/sparse search, reranking
+4. **Operational harness** — persistence, simulator integration, deployment, tracing, evaluation, tests
+
 ---
 
-## 2. Technology Stack
+## 2. Technology Stack Through the Harness Lens
 
 ### 2.1 Backend
 
@@ -116,13 +143,15 @@ IDA employs a **tiered model strategy** to balance cost, latency, and capability
 | `context_master` | gpt-5.2 | 1M tokens | $2.50 / $15.00 | Large context analysis |
 | `gemini` | Gemini-2.5-flash | — | — | Fallback / alt provider |
 
+From a harness perspective, tiering is not just a cost decision. It is an **execution policy mechanism**: different workflow steps can be assigned different reasoning budgets, latency profiles, and failure fallback paths.
+
 ---
 
-## 3. Modularity & Composition
+## 3. Execution Harness: Modularity & Composition
 
 ### 3.1 Agent Architecture
 
-IDA's agent system follows a **factory + capability** pattern. Each agent is a LangGraph `StateGraph` node graph, registered via `AgentFactory` and instantiated per-session.
+IDA's agent system follows a **factory + capability** pattern. From a harness perspective, this is the primary execution shell: each agent is not just a prompt wrapper, but a bounded LangGraph `StateGraph` with explicit node transitions, controlled tool access, and session-scoped instantiation via `AgentFactory`.
 
 ```mermaid
 graph LR
@@ -165,12 +194,21 @@ graph LR
     Delegator --> Others
 ```
 
-**Key design properties:**
+**Harness properties:**
 
 - **AgentBase** defines the contract: `capabilities`, `description`, `tools_filter`, graph construction
 - **ToolsFilter** controls per-agent, per-node tool visibility — each graph node sees only its allowed toolboxes/tools
 - **20 Toolboxes** provide composable tool bundles (RAG, project, data_visualization, simulation, SQL, skills, chat_record_data, etc.)
 - **Skills Framework** enables dynamic, user-defined tool loading at runtime
+
+This matters for harness engineering because it converts free-form model execution into **policy-constrained execution**. An agent can only act through the graph edges and tool surfaces exposed to it.
+
+In effect, IDA already implements the core harness pattern the user described:
+
+- **Planner/delegator** behavior in the orchestrator
+- **Executor** behavior in graph nodes and tool invocations
+- **Validator** behavior through typed schemas, filtered tool exposure, and response shaping
+- **State manager** behavior through persistent chat records, agent runs, and attached data payloads
 
 ### 3.2 Toolbox Composition
 
@@ -184,19 +222,37 @@ common_tools.py  →  registers 20 toolboxes globally
   LangGraph ToolNode  →  executes filtered tool set
 ```
 
-Each toolbox is a self-contained class with `setup_dependencies()` for DI and `get_tools()` returning LangChain `StructuredTool` instances. This enables:
+Each toolbox is a self-contained class with `setup_dependencies()` for DI and `get_tools()` returning LangChain `StructuredTool` instances. In harness terms, toolboxes are the **actuation layer**: they define what an agent is allowed to do to the outside world.
+
+This enables:
 
 - **Isolation** — toolboxes don't depend on each other
 - **Selective exposure** — agents see only relevant tools
 - **Token safety** — e.g., `ChatRecordDataToolbox` uses discover-then-fetch pattern to prevent context overflow
 
+The recent `ChatRecordDataToolbox` pattern is especially significant as harness engineering: it changes data access from uncontrolled payload injection to a two-stage contract of **catalog first, fetch second**.
+
+### 3.3 Step Runner, Validation, and Failure Handling
+
+Although the codebase is not labeled with a single "step runner" abstraction, the harness behavior is present across the LangGraph node structure, tool wrappers, and service layer boundaries:
+
+- **Step execution** is performed by graph nodes that encapsulate distinct reasoning or tool-use stages
+- **Input validation** is handled via Pydantic and SQLModel schemas at API, config, and tool boundaries
+- **Output shaping** is enforced through structured tool schemas, persisted chat record structures, and UI component payload formats
+- **Failure handling** is distributed across message-bus retries, filtered stream delivery, and guarded tool exposure
+- **Timeout/retry policy** is present in specific subsystems, but not yet elevated into a single unified workflow policy layer
+
+This is an important distinction: IDA already has many harness behaviors, but some of them are **embedded in components** rather than surfaced as a first-class, centralized runtime control plane.
+
 ---
 
-## 4. Data Architecture
+## 4. State Harness: Data Architecture
 
 ### 4.1 Database Layer
 
-PostgreSQL serves as the single source of truth, with 24 model files covering:
+PostgreSQL serves as the single source of truth. In harness terms, it is the **state ledger** for agent execution, user interaction, retrieval assets, and simulator outputs.
+
+The schema spans 24 model files covering:
 
 ```mermaid
 erDiagram
@@ -264,9 +320,9 @@ flowchart LR
 
 ---
 
-## 5. RAG Knowledge Engine
+## 5. Knowledge Harness: RAG Control Plane
 
-IDA implements a **hybrid retrieval-augmented generation** pipeline combining dense vector search with sparse lexical matching.
+IDA implements a **hybrid retrieval-augmented generation** pipeline combining dense vector search with sparse lexical matching. From a harness perspective, this is the mechanism that bounds model reasoning with curated, ranked, and source-scoped evidence.
 
 ### 5.1 Pipeline Architecture
 
@@ -292,11 +348,11 @@ Documents are organized into five retrieval scopes, enabling context-aware searc
 
 ---
 
-## 6. Message Bus & Real-Time Communication
+## 6. Runtime Harness: Message Bus & Real-Time Communication
 
 ### 6.1 Internal Message Bus
 
-The message bus is an **async queue-based pub/sub** system that decouples agent execution from API delivery:
+The message bus is an **async queue-based pub/sub** system that decouples agent execution from API delivery. In harness terms, it is the runtime coordination layer that turns internal agent events into persisted, filtered, and streamable user-visible state.
 
 ```mermaid
 sequenceDiagram
@@ -318,14 +374,27 @@ sequenceDiagram
     Note over SSE: Semantic payload filtering
 ```
 
-**Design properties:**
+**Harness properties:**
 - **Topic wildcards** — flexible subscription routing
 - **Per-client queues** — isolated delivery channels
 - **Sync wrappers** — bridge async bus to sync tool contexts
 - **Historian layer** — DB persistence with semantic filtering (suppresses empty/forwarded-only messages)
 - **SSE filtering** — payload-aware content gating at the API boundary
 
-### 6.2 SSE Event Model
+This is an important harness boundary because the system does not trust raw agent emissions to be directly user-facing. Messages are normalized and filtered twice: once on persistence and once on stream delivery.
+
+### 6.2 Logging, Tracing, and Runtime Visibility
+
+For harness engineering, execution visibility matters as much as execution itself. IDA currently exposes several runtime visibility mechanisms:
+
+- **Historian persistence** records user-visible interaction state
+- **SSE event streaming** exposes incremental execution state to clients
+- **LangSmith tracing hooks** provide model and chain observability when enabled
+- **Database-backed run state** allows agent instance lifecycle inspection
+
+The architecture therefore supports basic runtime tracing, but it is still stronger on **state capture** than on **operational telemetry**. A mature harness would typically add explicit metrics for queue depth, tool latency, model latency, failure rates, and retry counts.
+
+### 6.3 SSE Event Model
 
 The frontend connects via `EventSource` to `/api/projects/{id}/events`. Events carry typed payloads:
 
@@ -337,9 +406,9 @@ The frontend connects via `EventSource` to `/api/projects/{id}/events`. Events c
 
 ---
 
-## 7. Simulator Integration
+## 7. External Execution Harness: Simulator Integration
 
-IDA connects to external drilling engineering simulators through a **connector pattern** with schema-driven validation.
+IDA connects to external drilling engineering simulators through a **connector pattern** with schema-driven validation. In harness terms, these connectors are controlled escape hatches to deterministic engineering computation.
 
 | Connector | Domain | Purpose |
 |-----------|--------|---------|
@@ -357,7 +426,7 @@ Each connector:
 
 ---
 
-## 8. Security Architecture
+## 8. Guardrail Harness: Security & Policy Enforcement
 
 ### 8.1 Authentication
 
@@ -382,7 +451,7 @@ flowchart TD
     RBAC --> Handler[Route Handler]
 ```
 
-**Security layers:**
+**Harness layers:**
 - **JWT validation** — token signature + expiry verification via middleware
 - **RBAC** — role-based endpoint access (admin, user, viewer)
 - **Organization isolation** — data scoped to tenant boundaries
@@ -397,9 +466,11 @@ flowchart TD
 - **Token budgeting** — tiered model selection + discover-then-fetch data patterns prevent context overflow
 - **Output filtering** — historian and SSE layers suppress malformed/empty agent outputs
 
+These controls show that the platform already treats LLM outputs as **untrusted intermediate artifacts** until they pass through the surrounding harness.
+
 ---
 
-## 9. Deployment & Operations
+## 9. Operational Harness: Deployment & Operations
 
 ### 9.1 Container Architecture
 
@@ -456,9 +527,24 @@ Environment Variables (IDA_*)  →  highest priority
 
 Key configuration domains: database, authentication, LLM providers, simulator endpoints, agent thread pool sizing, LangSmith tracing.
 
+From a harness-engineering standpoint, the configuration stack is critical because it determines the behavior envelope of the system without code changes: model tier selection, auth mode, tracing, persistence, and connector endpoints are all runtime-controllable.
+
+### 9.4 Operational Control Surface
+
+Viewed strictly through the harness lens, operations in IDA are largely about controlling execution behavior in production:
+
+- selecting the auth regime
+- selecting provider/model tiers
+- enabling or disabling tracing
+- configuring DB and migration behavior
+- controlling simulator endpoints and credentials
+- tuning thread-pool and worker behavior
+
+That makes the configuration layer part of the harness itself, not merely deployment plumbing.
+
 ---
 
-## 10. Testing & Quality Assurance
+## 10. Verification Harness: Testing & Quality Assurance
 
 ### 10.1 Test Strategy
 
@@ -477,43 +563,63 @@ Key configuration domains: database, authentication, LLM providers, simulator en
 - **Migration safety** — Alembic manages schema changes with up/down reversibility
 - **Semantic filtering** — runtime guards against empty/malformed agent outputs at DB and SSE layers
 
+The current verification harness is solid at the structural level, but still uneven at the behavioral level. The codebase has the pieces needed for strong harness verification, yet most evidence points to **unit and integration confidence**, not a full **agent-evaluation harness** with systematic scenario replay, prompt regression suites, or tool-usage trace assertions.
+
+### 10.3 Evaluation Harness Maturity
+
+Using the user's definition, this is the clearest place where harness engineering can still expand. A stronger evaluation harness for IDA would include:
+
+1. **Prompt/agent regression suites** — fixed scenario sets with expected behavioral envelopes
+2. **Workflow replay** — rerunning historical tasks against new prompts, tools, or models
+3. **Trace-based assertions** — checking not just the final answer, but which tools were called and in what order
+4. **Structured output scoring** — validating charts, reports, and data payloads against schemas and quality rules
+5. **Failure injection** — simulator outage, malformed tool output, token overflow, and auth failure scenarios
+
+That is the difference between a system that can run and a system that can be **safely evolved**.
+
 ---
 
-## 11. Architectural Patterns Summary
+## 11. Harness Patterns Summary
 
-| Pattern | Where Applied | Benefit |
+| Harness Pattern | Where Applied | Harness Value |
 |---------|--------------|---------|
-| **Factory + Registry** | Agent creation via AgentFactory | Dynamic agent instantiation, capability-driven routing |
-| **StateGraph (DAG)** | LangGraph agent execution | Deterministic, debuggable agent workflows |
-| **Toolbox Composition** | 20 toolboxes via ToolsFilter | Selective tool exposure, token safety |
-| **Discover-then-Fetch** | ChatRecordDataToolbox | Prevents context overflow with large datasets |
-| **Hybrid Retrieval** | RAG (dense + sparse + rerank) | Precision + recall in knowledge search |
-| **Pub/Sub Message Bus** | Agent → Historian → SSE → Client | Decoupled async event delivery |
-| **Tiered Model Selection** | 6 LLM tiers (nano → 5.2) | Cost/capability optimization |
-| **Multi-stage Docker** | Node build → Python runtime | Minimal production image |
-| **Config Hierarchy** | Env > YAML > defaults | Flexible deployment configuration |
-| **Connector Pattern** | 5 simulator connectors | Schema-validated external integration |
+| **Factory + Registry** | Agent creation via AgentFactory | Centralized control over what workers exist and when they can be instantiated |
+| **StateGraph (DAG)** | LangGraph agent execution | Converts stochastic reasoning into bounded, inspectable execution paths |
+| **Toolbox Composition** | 20 toolboxes via ToolsFilter | Restricts actuation surfaces to task-relevant operations |
+| **Discover-then-Fetch** | ChatRecordDataToolbox | Prevents uncontrolled context injection from large datasets |
+| **Hybrid Retrieval** | RAG (dense + sparse + rerank) | Grounds generation in ranked evidence rather than raw model recall |
+| **Pub/Sub Message Bus** | Agent → Historian → SSE → Client | Separates generation, persistence, and delivery into controllable stages |
+| **Tiered Model Selection** | 6 LLM tiers (nano → 5.2) | Matches capability and risk profile to task class |
+| **Multi-stage Docker** | Node build → Python runtime | Stabilizes runtime packaging and deployment reproducibility |
+| **Config Hierarchy** | Env > YAML > defaults | Makes harness behavior tunable without changing code |
+| **Connector Pattern** | 5 simulator connectors | Wraps external deterministic engines behind validated interfaces |
 
 ---
 
-## 12. Engineering Assessment
+## 12. Harness Engineering Assessment
 
 ### Strengths
 
-1. **Deep modularity** — the toolbox/agent/skills layering enables feature composition without cross-cutting changes
-2. **Token-aware architecture** — tiered models + discover-then-fetch patterns address LLM context limits structurally
-3. **Hybrid RAG** — combining dense vectors, sparse BM25, and cross-encoder reranking delivers strong retrieval quality
-4. **Real-time reactivity** — SSE + message bus + Vue composables create a responsive user experience
-5. **Flexible auth** — three-mode authentication (Keycloak / Azure / none) supports diverse deployment scenarios
-6. **Single-container simplicity** — multi-stage Docker build produces one deployable artifact with frontend baked in
+1. **Strong execution containment** — LangGraph state machines, factory registration, and tool filters give IDA a real execution harness instead of prompt-only agents
+2. **Controlled actuation surfaces** — toolbox composition limits what agents can touch and creates a clean place to enforce policy
+3. **Evidence-bounded reasoning** — hybrid RAG and scoped knowledge domains reduce dependence on unconstrained model recall
+4. **Stateful runtime accountability** — historian persistence plus SSE filtering produce an inspectable chain from agent event to user-visible output
+5. **Practical guardrails already exist** — auth modes, semantic output suppression, model tiering, and schema validation form a credible baseline harness
+6. **Operational simplicity** — a single deployable backend/frontend artifact lowers the risk surface for early-stage operations
 
-### Areas for Engineering Attention
+### Areas for Harness Attention
 
-1. **Test coverage depth** — current test infrastructure exists but coverage breadth across 13 agents and 20 toolboxes could be expanded
-2. **Horizontal scaling** — single-container architecture with in-memory state (message bus queues, FAISS indexes) limits horizontal scaling without architectural changes
-3. **Observability** — LangSmith tracing is available but structured logging, metrics (Prometheus), and distributed tracing could be formalized
-4. **Schema evolution** — heavy JSONB usage provides flexibility but reduces queryability and makes schema documentation critical
-5. **Simulator coupling** — connector pattern is clean but external API availability is a runtime dependency with limited fallback
+1. **Evaluation harness depth** — the system would benefit from explicit agent regression suites, scenario replay, golden traces, and tool-call assertions
+2. **Runtime observability** — LangSmith helps, but production harnessing would be stronger with structured logs, metrics, latency budgets, and failure dashboards
+3. **Scale-out semantics** — in-memory queues and FAISS-backed state introduce friction for horizontally scaled or multi-worker execution
+4. **State contract clarity** — heavy JSONB use is flexible, but harnesses become easier to validate when critical state has stricter typed contracts
+5. **External dependency hardening** — simulator connectors and provider APIs need clearer fallback, retry, and degradation strategies to keep the harness stable under partial failure
+
+### Bottom Line
+
+IDA is not merely an AI application with multiple agents. It is already a meaningful **LLM harness system**: the codebase wraps generative behavior in orchestration logic, graph-based execution, tool restrictions, typed boundaries, retrieval controls, state persistence, stream filtering, and deployment-time policy.
+
+Using the stricter definition of harness engineering, IDA's center of gravity is not the prompt alone and not the model alone. It is the **system that runs the model safely**. The next maturity step is therefore not adding raw capability first; it is strengthening the **evaluation, observability, retry/timeout policy, and failure-management harness** around the capability that already exists.
 
 ---
 
