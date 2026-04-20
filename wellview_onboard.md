@@ -113,11 +113,11 @@ Despite different source systems, DDR time logs and WellView time logs use **the
 
 ## 3. Classification
 
-The LLM classifier already produces `well_view` correctly. Two improvements needed:
+The LLM classifier already produces `well_view` correctly. One improvement needed:
 
-### 3.1 Heuristic Pre-Check for Excel (no LLM needed)
+### Heuristic Pre-Check for Excel (no LLM needed)
 
-Scan Row 1 of each sheet for the `wv*.` prefix. If found, classify as `well_view` immediately. This is a near-perfect, near-zero-cost signal unique to WellView exports — far more reliable than matching display names.
+Scan Row 1 for the `wv*.` prefix. If found, classify as `well_view` immediately — no LLM call needed. This is a near-perfect, near-zero-cost signal unique to WellView exports.
 
 ```mermaid
 flowchart LR
@@ -126,10 +126,6 @@ flowchart LR
     B -->|No| D[LLM classifier]
     D --> E[well_view / ddr / other]
 ```
-
-### 3.2 Sheet-Level Classification
-
-Classify each sheet independently. A single workbook may mix WellView-exported sheets with manually added sheets. Sheet type is determined by the `wv<table>` prefix in Row 1, not the sheet name.
 
 ---
 
@@ -143,7 +139,7 @@ Classify each sheet independently. A single workbook may mix WellView-exported s
 
 ```mermaid
 flowchart TD
-    subgraph Global["Global — fixed WellView schema"]
+    subgraph Global["Global — assumed fixed WellView schema ⚠️"]
         G1["WELLVIEW_CANONICAL_FIELDS\nwv&lt;table&gt;.&lt;field&gt; → canonical name"]
     end
     subgraph OrgConfig["Per-Org Config — WellViewOrgConfig"]
@@ -158,8 +154,10 @@ flowchart TD
     OrgConfig --> Normalize
 ```
 
-The global mapping covers all `wv<table>.<field>` field names (consistent across orgs). Org-level config handles only:
-- Which sheet holds which table (sheet names vary)
+This design **assumes** `wv<table>.<field>` names are identical across all organizations and WellView versions — observed in one ENI Congo export. Whether this holds across operators, WellView versions, and custom configurations needs validation. See Open Questions.
+
+Org-level config handles:
+- Which sheet holds which table (sheet names vary by export template)
 - Activity/operation/phase code dictionaries (same taxonomy as DDR)
 - Unit preference
 
@@ -499,10 +497,20 @@ gantt
 
 ## 13. Open Questions
 
+### For drilling engineers
+
+| # | Question | Why it matters |
+|---|----------|---------------|
+| 1 | **Are `wv<table>.<field>` DB field names identical across all WellView installations and versions?** | The entire normalization strategy depends on this. Observed in one ENI Congo export — needs confirmation across operators and WellView versions. If field names vary, org-level config must also cover field name mappings, not just sheet location. |
+| 2 | **Do all operators export WellView using the same multi-row header convention (Row 1 = DB fields, Row 2 = units, Row 3 = display names)?** | This is the detection and parsing foundation. If some orgs export without DB field names in Row 1, the heuristic pre-check fails. |
+| 3 | **Is the Phase/Operation/Activity/Plan code taxonomy truly consistent between DDR systems and WellView across operators?** | Shared codes are what make DDR↔WellView reconciliation meaningful. If operators use different code sets in each system, reconciliation degrades to timestamp-only alignment. |
+| 4 | **How complete and reliable are WellView exports in practice?** | Are there commonly missing sheets? Are timestamps always populated? Are depth values in consistent units within a single export? |
+| 5 | **Which sheets are most commonly included in a WellView export?** | Helps prioritize Phase 1 ingestion scope — time log is assumed universal, but trajectory, mud, and casing inclusion may vary. |
+
+### Design decisions (internal)
+
 | # | Question | Options |
 |---|----------|---------|
-| 1 | **Normalize on DB field names?** | Use `wv<table>.<field>` (Row 1) as canonical key — org config handles code mappings and sheet location only. |
-| 2 | **All sheets vs time log only in Phase 1?** | Phase 1: time log only (fastest to value). Phase 2: add trajectory, mud, BHA. |
-| 3 | **NPT code mapping** | WellView and DDR share the same Phase/Operation/Activity taxonomy — share the org-level code config? Or maintain separate mappings for flexibility? |
-| 4 | **Phase detection** | `wvjobprogramphase` sheet provides explicit section boundaries when present. Infer from depth + activity codes when absent. |
-| 5 | **`tool_compare_wells` extension** | Add `source: "ddr" \| "well_view" \| "auto"` param — `"auto"` picks WellView if available, DDR otherwise. |
+| 6 | **All sheets vs time log only in Phase 1?** | Phase 1: time log only (fastest to value). Phase 2: add trajectory, mud, BHA. |
+| 7 | **NPT code mapping** | Share the org-level code config with DDR, or maintain separate WellView mappings? |
+| 8 | **Phase detection** | Use `wvjobprogramphase` sheet when present; infer from depth + activity codes when absent. |
