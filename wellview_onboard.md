@@ -31,7 +31,7 @@ WellView data enters IDA in two forms:
 
 ### The Excel Export is a Multi-Sheet Database Dump
 
-A WellView Excel export is **not** a single activity table. It is a structured dump of the WellView database across multiple sheets. A typical 10-sheet export covers:
+A WellView Excel export is **not** a single activity table. It is a structured dump of the WellView database across multiple sheets. Aan Eni example of 10-sheet export covers:
 
 | Sheet (name varies) | WellView Table | Content |
 |--------------------|----------------|---------|
