@@ -29,8 +29,59 @@ flowchart TD
 **What works:**
 - Cheatsheet accumulates knowledge within a chat via a dedicated curator LLM
 - Chat record data toolbox provides structured access to staged results and visualizations
-- ContextCompressor embeds chat history into RAG
+- ContextCompressor indexes all chat records into RAG and compresses long messages
 - `agent_memory` infrastructure exists with PROJECT / ORG / GLOBAL scopes
+
+---
+
+## ContextCompressor — Detailed Analysis
+
+The ContextCompressor is a continuous background agent (polls every 5s) that
+does **two separate jobs** in one agent:
+
+```mermaid
+flowchart TD
+    A[New chat records\nUSER + AGENT] --> B[Job 1: _index_chat_records\nALL messages → RAG embedding\nsource_type=CHAT\nno length threshold]
+    A --> C{Job 2: len message\n> 2000 chars?}
+    C -->|Yes| D[LLM summarize → 300 words\nsave to compressed_message\nMICRO_SMART model]
+    C -->|No| E[No compression\noriginal message only]
+    B --> F[(RAG index\noriginal message content)]
+    D --> G[(chat_record.compressed_message)]
+    F -.->|diverge: RAG has original\nnot the compressed version| G
+```
+
+**Job 1 — RAG Indexing (all messages, no threshold):**
+Every USER and AGENT message is embedded into the RAG index with
+`source_type=CHAT`. This is the infrastructure that would power
+`tool_search_chat_history` — the embeddings already exist.
+
+**Job 2 — Compression (messages > 2000 chars only):**
+Long messages are summarized to ~300 words and stored in
+`compressed_message`. The orchestrator (`ida.py`) uses
+`compressed_message or message` when loading history — so it
+benefits automatically. Sub-agents (`datainsight.py`,
+`simulator_agent.py` etc.) load raw `message` and **never see
+the compressed version**.
+
+### Known Issues in ContextCompressor
+
+| Issue | Detail | Risk |
+|---|---|---|
+| **GLOBAL scope cursor is wrong** | `last_processed_chat_record_id` stored as GLOBAL scope — shared across all projects on the deployment. One project's cursor silently overwrites another's | High — multi-project deployments lose records |
+| **RAG index diverges from compressed_message** | RAG embeds original message; compression writes to a separate field. The RAG index is never updated with the cleaner summary | Medium — search returns noisy original content |
+| **No deduplication on indexing** | `add_document_batch` + `generate_embeddings` has no check for already-embedded records — restarts create duplicate RAG entries | Medium — degrades search quality |
+| **Sub-agents don't use compressed_message** | Only `ida.py` reads `compressed_message or message`. All sub-agents read raw `message`, making compression invisible to them | Medium — wasted compression work for sub-agents |
+| **Two jobs, one cursor** | Indexing and compression share one `last_processed_chat_record_id`. A compression failure still advances the cursor, so failed compressions are never retried | Low — silent data quality gap |
+
+### What This Means for Gap 1
+
+The RAG embeddings are already there — `_index_chat_records` runs on every
+message. `tool_search_chat_history` does not need new embedding infrastructure.
+It only needs a `source_type=CHAT` + `project_id` filter surfaced as a tool.
+
+Fix the cursor scope bug **before** building on top of this infrastructure —
+otherwise `tool_search_chat_history` will return incomplete results in
+multi-project deployments.
 
 ---
 
@@ -490,10 +541,16 @@ vector store — no new backend needed.
 ### Recommended build order
 
 ```
+Phase 0 (fix before building on top):
+  Fix ContextCompressor cursor scope: GLOBAL → PROJECT scope
+  Fix ContextCompressor deduplication: check source_id before re-embedding
+  Feed compressed_message back into RAG index when compression runs
+
 Phase 1 (foundation):
   Schema migration → add memory_type, user_id, content_text, confidence
   ChatHistoryService → centralize all agent history loading
   tool_search_chat_history → Gaps 1 + 6
+  Update sub-agents to use compressed_message via ChatHistoryService
 
 Phase 2 (persistence):
   ConsolidationAgent → Gaps 2 + 7
