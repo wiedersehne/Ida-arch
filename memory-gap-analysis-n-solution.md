@@ -256,6 +256,29 @@ orchestrator's planning step — not by the agents doing the actual work.
 
 **Solution:**
 
+```mermaid
+flowchart TD
+    subgraph Session1 ["Session N"]
+        S1A[Turn-by-turn exchange] -->|CheatsheetAgent 20s poll| S1B[chat.playbook\nper-chat cheatsheet]
+    end
+
+    subgraph Session2 ["Session N+1"]
+        S2A[Turn-by-turn exchange] -->|CheatsheetAgent 20s poll| S2B[chat.playbook\nper-chat cheatsheet]
+    end
+
+    S1B -->|session close / 30-min inactivity| CONS[ConsolidationAgent\nDistill: what is durable\nbeyond this chat?]
+    S2B -->|session close / 30-min inactivity| CONS
+
+    CONS -->|entity finding| AM1[agent_memory\nentity_NNM101\nscope=PROJECT]
+    CONS -->|project lesson| AM2[agent_memory\nproject_lessons\nscope=PROJECT]
+    CONS -->|chat-specific| DISC[Discard —\nstays in playbook only]
+
+    AM1 --> INJECT
+    AM2 --> INJECT
+    INJECT[Session-start injection\ntool_read_memory PROJECT] -->|orchestrator plan step| ORC[ida_agent\nplanning with prior knowledge]
+    INJECT -->|tool_read_playbook in AGENT.md| SUB[sub-agents\ndata_insight / sme / viz]
+```
+
 *Session persistence* — ConsolidationAgent (EP-4) writes to PROJECT-scoped
 `agent_memory` at session end.
 
