@@ -174,37 +174,54 @@ call `tool_search_chat_history` first.
 
 ---
 
-### EP-2 — Structured Data in Chat Is Not Content-Searchable
+### EP-2 — No Content Search Over Agent Memory
 
-**New insight — second-round analysis:**
-ContextCompressor embeds each message as a single text blob. A response containing
-a 30-row NPT table for NNM-101 embeds as one vector representing the whole message.
-Searching "NNM-101 stuck pipe duration" retrieves the message but cannot point to
-the specific value.
-
-Compare to OpenClaw's `memory_search` — hybrid semantic + keyword over structured
-daily notes — and the cheatsheet's own entity-specific Data Insights structure.
-
-The cheatsheet already does structured extraction (entity → metric → value).
-But its output never feeds back into the RAG index. The two systems don't talk
-to each other.
-
-**Solution:**
-When the CheatsheetAgent adds a new Data Insight entry, also write a targeted
-RAG embedding for that entity+metric combination:
+**Current state:**
+Within a session, the cheatsheet is injected into context and the agent reads
+it directly — no tool needed. But across sessions, facts promoted to
+`agent_memory` (PROJECT scope) are only retrievable by exact key:
 
 ```python
-# After curator runs and new entity data is detected:
-rag_service.add_document(RagEmbedding(
-    content=f"Well NNM-101: NPT total 54.2h, main causes: stuck pipe 48%, equipment 21%",
-    source_type=SourceType.CHEATSHEET,   # new source type
-    source_id=chat_record_id,
-    project_id=project_id,
-    metadata={"entity": "NNM-101", "metric_type": "npt"}
-))
+tool_read_memory(name="entity_NNM101", scope=PROJECT)
 ```
 
-This gives search results that point to specific facts, not just message blobs.
+There is no `tool_search_memory`. If the agent doesn't know the key — or
+wants to answer "which wells had NPT above 10%?" — it cannot search by content.
+`tool_list_memories` returns all records without filtering; loading all of them
+to scan is not scalable as the project grows.
+
+**Solution — `tool_search_memory` backed by FTS:**
+
+Requires EX-5's `content_text` field. Once that column exists:
+
+```python
+def tool_search_memory(
+    query: str,
+    project_id: int,
+    scope: AgentMemoryScope = AgentMemoryScope.PROJECT,
+    memory_type: Optional[str] = None,   # e.g. "entity", "lesson", "user_pref"
+    top_k: int = 10,
+) -> str: ...
+# SQL: WHERE content_text @@ plainto_tsquery(query) AND scope = scope
+```
+
+```mermaid
+flowchart TD
+    A[Agent needs facts\nbut doesn't know the key] --> B[tool_search_memory\nquery + scope=PROJECT]
+    B --> C[FTS on content_text\nPostgreSQL plainto_tsquery]
+    C --> D[Ranked memory records]
+    D --> E{Needs full detail?}
+    E -->|Yes| F[tool_read_memory by name\nfetch full entity record]
+    E -->|No| G[Use content_text summary]
+
+    H[Agent knows the key\ne.g. entity_NNM101] --> F
+```
+
+**Relationship to EX-3:**
+EX-3 handles *loading strategy* — how much to inject into context at session
+start. EP-2 handles *search* — how to query facts when the key is unknown or
+the query spans multiple entities. Both are needed: EX-3 for context efficiency,
+EP-2 for content discovery.
 
 ---
 
@@ -479,7 +496,7 @@ no data loss.
 | Gap | Layer | Severity | Depends on |
 |---|---|---|---|
 | **EP-1** Chat history tail-only, not searchable | Episodic | High | Fix CC cursor bug first |
-| **EP-2** Structured data not content-searchable | Episodic | Medium | EP-1 infra |
+| **EP-2** No content search over agent_memory | Episodic | Medium | EX-5 schema |
 | **EP-3** No cross-chat retrieval | Episodic | Medium | EP-1 (`chat_id=None`) |
 | **EP-4** No end-of-session consolidation | Episodic → External | Medium | EX-5 schema |
 | **EX-1** Cheatsheet doesn't cross session boundaries | External | High | EP-4 + EX-5 |
@@ -508,7 +525,7 @@ Phase 2 — External persistence foundation (EX-5, EP-4, EX-1)
 Phase 3 — External memory features (EX-2, EX-3, EP-2)
   ├── User profile — USER scope + preference detection
   ├── Two-tier cheatsheet — index + entity detail records
-  └── Cheatsheet → RAG feedback loop (entity embeddings from curator output)
+  └── tool_search_memory — FTS over agent_memory content_text
 
 Phase 4 — Quality and UX (EX-4)
   ├── Source tagging + confidence tiers in curator prompt
