@@ -247,10 +247,63 @@ flowchart TD
     A[Session end trigger] --> B[Load chat.playbook\n+ last 20 records]
     B --> C[Consolidation LLM:\nWhat is durable beyond this chat?]
     C --> D{Per entry}
-    D -->|Entity finding| E[→ agent_memory\nentity_NNM101\nscope=PROJECT]
+    D -->|Entity finding| V{Verify against\nstaged source record}
+    V -->|Confirmed| E[→ agent_memory\nentity_NNM101\nscope=PROJECT\nconfidence=high]
+    V -->|Not confirmed| EL[→ agent_memory\nconfidence=low\nflagged for review EX-4]
     D -->|Project lesson| F[→ agent_memory\nproject_lessons\nscope=PROJECT]
     D -->|Chat-specific| G[Stay in playbook only]
 ```
+
+**Verification before write:** entity findings must be cross-checked against
+the staged source record from the same turn before promotion to `agent_memory`.
+An unverified fact written to PROJECT scope will surface confidently in future
+sessions — a wrong value is worse than a missing one.
+
+---
+
+### EP-5 — Staged Data Only Written for Three Hardcoded Analysis Types
+
+**Current state:**
+`_extract_viz_and_data` in `datainsight.py` only stages results for three
+hardcoded context keys:
+
+| Context key | Staged as |
+|---|---|
+| `activity_well_results` | NPT/activity events per well |
+| `depth_well_results` | Progress/depth tables per well |
+| `cost_well_results` | Cost data per well |
+
+Any other analysis — WellView trajectory, formation tops, wellbore comparison,
+custom queries — produces no staged data. `subject_matter_expert.py` never
+writes staged data at all.
+
+**Impact on the follow-up question pattern:**
+When a user asks "what was X from that analysis?", the reliable fallback is
+`tool_get_record_data` fetching the previous turn's staged payload. This only
+works for the three types above. For everything else the agent falls back to
+the truncated chat tail (200 chars) — which will not preserve specific values.
+
+**Fix — extract tables from final message universally:**
+
+Rather than fixing each agent's context-key staging individually, extract
+markdown tables from the final response message at the point it is generated —
+regardless of which agent produced it. This covers `data_insight_agent`,
+`sme_agent`, and any future agent without per-agent changes.
+
+Implementation approach:
+- Add `_extract_tables_from_message(text) -> list[dict]` as a static method on
+  `AgentBase` — available to all agents
+- Each agent calls it on `final_message` before constructing the `ChatRecord`
+- Resulting table rows are merged into `staged` in `ChatRecordData`
+- For `data_insight_agent`, message tables complement context-key staged data
+  (structured JSON from context keys is richer; message tables are the fallback)
+- For `sme_agent`, this is the only staged data path — tables from document
+  answers become retrievable on follow-up
+
+The parser finds markdown table blocks (header row + separator row + data rows),
+parses each into a list of `{column: value}` dicts, and returns them as
+`{"description": "Table: col1, col2, ...", "data": [...]}` entries — the same
+shape as existing staged entries in `data_insight_agent`.
 
 ---
 
@@ -320,7 +373,7 @@ session). Claude Code uses user-scoped CLAUDE.md.
 
 **Solution:**
 Store user profile in `agent_memory` (USER scope — requires schema change,
-see EX-4). Written when user states a preference or the agent detects a
+see EX-5). Written when user states a preference or the agent detects a
 consistent pattern:
 
 ```python
@@ -479,7 +532,7 @@ no data loss.
 |---|---|---|---|
 | **QMD** | Local-first sidecar, reranking, query expansion | External process | Re-evaluate if RAG search is too slow at scale |
 | **Honcho** | Cross-session user modeling, multi-agent awareness | Cloud service | Re-evaluate for multi-org deployments; data policy risk |
-| **Mem0** | Semantic memory graph, automatic fact extraction | Cloud / self-hosted | Re-evaluate if entity extraction at EP-2 proves too complex |
+| **Mem0** | Semantic memory graph, automatic fact extraction | Cloud / self-hosted | Re-evaluate if ConsolidationAgent (EP-4) entity extraction proves too complex |
 | **ChromaDB / Qdrant** | Dedicated vector DB, better ANN at scale | External process | Re-evaluate if PostgreSQL vector store bottlenecks |
 
 **Recommendation: defer all external backends.**
@@ -499,6 +552,7 @@ no data loss.
 | **EP-2** No content search over agent_memory | Episodic | Medium | EX-5 schema |
 | **EP-3** No cross-chat retrieval | Episodic | Medium | EP-1 (`chat_id=None`) |
 | **EP-4** No end-of-session consolidation | Episodic → External | Medium | EX-5 schema |
+| **EP-5** Staged data only for 3 hardcoded types | Episodic | High | Independent |
 | **EX-1** Cheatsheet doesn't cross session boundaries | External | High | EP-4 + EX-5 |
 | **EX-2** No user profile | External | Medium | EX-5 schema (USER scope) |
 | **EX-3** No progressive memory loading | External | Medium | EP-4 + EX-5 |
@@ -508,10 +562,12 @@ no data loss.
 ### Build Order
 
 ```
-Phase 0 — Fix ContextCompressor (prerequisite for everything)
-  ├── Cursor scope: GLOBAL → PROJECT
-  ├── Dedup check before re-embedding
-  └── Re-index with compressed_message when compression runs
+Phase 0 — Fix infrastructure bugs (prerequisite for everything)
+  ├── ContextCompressor cursor scope: GLOBAL → PROJECT
+  ├── ContextCompressor dedup check before re-embedding
+  ├── ContextCompressor re-index with compressed_message when compression runs
+  └── Staged data: make _extract_viz_and_data generic (EP-5)
+      + SME agent stages RAG excerpts
 
 Phase 1 — Episodic retrieval (EP-1, EP-3)
   ├── ChatHistoryService — centralize all agent history loading
@@ -536,5 +592,7 @@ Phase 5 — External backend evaluation (if needed)
 ```
 
 **All phases use existing infrastructure.** No new DB tables or external backends
-required in Phases 0–4. The key insight: ContextCompressor already does the
-hard work of embedding everything — IDA just lacks the tools to query it.
+required in Phases 0–4. Two key insights: ContextCompressor already embeds all
+chat history into RAG — EP-1 just needs a retrieval tool on top. And agent_memory
+already has the right scope model — EX-5 adds the columns needed to make it
+searchable and typed.
