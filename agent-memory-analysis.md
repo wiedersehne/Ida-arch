@@ -98,33 +98,76 @@ flowchart TD
 
 ## 2. OpenClaw
 
+### Design Principle
+
+OpenClaw's architecture rests on a single constraint: **files are the single
+source of truth**. *"What's not written to a file doesn't exist."* This is an
+architectural rule, not a preference — all long-term agent state must be
+persisted to Markdown files on disk. The payoff is full transparency: any file
+can be opened, edited, and version-controlled. The cost is that complex
+relational queries and fast exact-match lookups are weaker than a database.
+
 ### External Memory
 
-OpenClaw uses a fully transparent file-based system. There is no hidden internal
-state: *"The model only 'remembers' what gets saved to disk."*
-
-Three memory files serve distinct roles:
+Three memory files serve distinct roles, mapping to two time horizons:
 
 | File | Role | Load behavior |
 |---|---|---|
-| `MEMORY.md` | Long-term durable facts, preferences, decisions | Every session |
-| `memory/YYYY-MM-DD.md` | Daily running context and observations | Today + yesterday auto-loaded |
+| `MEMORY.md` | Long-term distilled facts, preferences, decisions | Every session |
+| `memory/YYYY-MM-DD.md` | Short-term daily log — all context, append-only | Today + yesterday auto-loaded |
 | `DREAMS.md` | Consolidation summaries, human-reviewable | On demand / human review |
 
 All files live in the agent workspace (`~/.openclaw/workspace` by default).
+
+**Two-layer design — solving the context window tension:**
+
+The short-term layer (daily notes) ensures nothing is lost. The long-term layer
+(MEMORY.md) ensures high-value facts are always in context. The trade-off is
+that promoting short-term → long-term requires an active distillation step;
+memory quality depends on that process running correctly.
 
 **Storage backends:**
 
 | Backend | Mechanism | Features |
 |---|---|---|
-| Builtin (default) | SQLite | Keyword + vector search |
+| Builtin (default) | SQLite via `sqlite-vec` | Hybrid keyword + vector search |
 | QMD | Local sidecar | Reranking + query expansion |
 | Honcho | Cloud service | Cross-session user modeling, multi-agent awareness |
 
 **Retrieval tools:**
 
-- `memory_search` — hybrid semantic (vector) + keyword search
+- `memory_search` — hybrid search: **semantic (vector) + BM25 keyword** run in
+  parallel, results merged. Semantic handles paraphrase; BM25 handles exact
+  token matches (e.g. specific API names, field codes). Vector index stored in
+  SQLite via `sqlite-vec` — no standalone vector database required.
 - `memory_get` — direct file read by path or line range
+
+### Context Compaction — Memory Flush
+
+Long sessions accumulate conversation history that eventually overflows the
+context window. When compaction is triggered, the conversation history is
+replaced by a summary — but any fact that existed *only* in conversation history
+is lost. OpenClaw's solution is **Memory Flush**:
+
+```
+Compaction detected (approaching context limit)
+        ↓
+Silent Memory Flush agent turn
+        ↓
+Agent writes all important in-context state to memory/YYYY-MM-DD.md
+        ↓
+Compaction executes (conversation history summarized)
+        ↓
+Session continues — file-persisted facts survive intact
+```
+
+This turns "files are the single source of truth" from a manual discipline into
+a system-level guarantee. Files are never touched by compaction; only
+conversation history is compressed.
+
+This is a critical safety net for a known failure pattern: user tells the agent
+a rule mid-conversation → agent acknowledges → compaction fires → rule disappears
+→ agent silently violates it in later turns.
 
 ### Episodic Memory — The Dreaming System
 
@@ -168,6 +211,10 @@ episodic history without polluting long-term memory.
 - No hidden state — full transparency by design
 - Daily notes = episodic layer with clear time-based scoping
 - Promotion threshold prevents noise from accumulating in long-term memory
+- **Dreaming is experimental and off by default.** The hard problem: deciding
+  what is "worth" long-term retention requires contextual judgment that is
+  difficult to encode as rules. Human-in-the-loop via DREAMS.md review is the
+  current fallback.
 
 ---
 
@@ -285,21 +332,22 @@ flowchart LR
 
 | Dimension | Hermes | OpenClaw | Claude Code |
 |---|---|---|---|
-| **Storage** | Flat files + SQLite + plugins | Flat files + SQLite/QMD/Honcho | Flat files |
+| **Storage** | Flat files + SQLite + plugins | Flat files + SQLite (sqlite-vec)/QMD/Honcho | Flat files |
 | **Load strategy** | Frozen snapshot at start | Full load at start | Index at start, topics on demand |
 | **Author** | Agent | Agent | Human (CLAUDE.md) + Agent (auto memory) |
 | **Scope** | Single user, global | Workspace | Project / user / org / managed policy |
 | **External plugins** | 8 providers | 3 backends | None (file-based only) |
 | **Size management** | Hard char limits per file | Promotion threshold gates LT memory | 200-line / 25KB index cap |
 | **Prefix cache optimization** | Yes (frozen snapshot) | No | Implicit (loaded as context) |
+| **Compaction safety** | None | Memory Flush (pre-compaction write to disk) | None |
 
 ### Episodic Memory
 
 | Dimension | Hermes | OpenClaw | Claude Code |
 |---|---|---|---|
 | **Episodic store** | SQLite state.db (FTS5) | Daily notes YYYY-MM-DD.md | Auto memory topic files |
-| **Retrieval** | Explicit `session_search` tool | `memory_search` (hybrid) + `memory_get` | On-demand file read |
-| **Consolidation** | Manual (agent writes to MEMORY.md) | Automatic Dreaming pipeline | Agent decides at session end |
+| **Retrieval** | Explicit `session_search` tool | BM25 + semantic (sqlite-vec) hybrid | On-demand file read |
+| **Consolidation** | Manual (agent writes to MEMORY.md) | Dreaming pipeline (experimental, off by default) | Agent decides at session end |
 | **Human oversight** | None | DREAMS.md review | Editable markdown files |
 | **Episodic → Semantic path** | Agent-driven + skill crystallization | Dreaming threshold scoring | Agent-driven (topic files) |
 | **Time-based scoping** | No | Yes (date-stamped daily notes) | No (project-scoped) |
@@ -354,7 +402,12 @@ like an agent with no episodic memory — it forgets findings between sessions.
 - **From OpenClaw:** A Dreaming-style consolidation step at session end could
   promote significant findings from the playbook into long-term `agent_memory`.
   Human-reviewable consolidation (equivalent to DREAMS.md) would give engineers
-  visibility into what IDA has learned about their wells.
+  visibility into what IDA has learned about their wells. More urgently: IDA's
+  `ContextCompressor` is analogous to OpenClaw's compaction — any facts that
+  live only in conversation history are lost when it fires. A Memory Flush step
+  before compression (write playbook + key findings to `agent_memory` before
+  compacting) would close this gap and is lower-effort than a full Dreaming
+  pipeline.
 
 - **From Claude Code:** The index + on-demand topic file pattern maps well to
   IDA's skill system. A well-structured `agent_memory` with a lightweight index
