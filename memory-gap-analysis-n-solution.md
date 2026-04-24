@@ -59,6 +59,71 @@ The architecture has no episodic retrieval path and no external persistence path
 
 ---
 
+## Proposed Architecture
+
+```mermaid
+flowchart TD
+    subgraph IC ["In-Context — injected every turn"]
+        TAIL[Last 12 messages\ncompressed_message or message]
+        PB[chat.playbook\nauto-injected by orchestrator]
+        PI[project_index\n< 500 tokens · one-liner per well]
+        UP[user_profile\n< 200 tokens · prefs + conventions]
+    end
+
+    subgraph SL ["Session Layer — chat-scoped"]
+        CR[(chat_record\nfull history)]
+        CS[chat.playbook\nCheatsheetAgent 20s]
+    end
+
+    subgraph BG ["Background"]
+        CC[ContextCompressor\n5s · compress > 2000 chars\n+ embed all → RAG]
+        CA[CheatsheetAgent\n20s · curate per exchange]
+    end
+
+    subgraph CONS ["ConsolidationAgent — NEW\nsession end or 25+ exchanges"]
+        GATE["LLM gate: what is durable beyond this chat?\nentity fact · project lesson · user pref · discard"]
+    end
+
+    subgraph PL ["Project Layer — agent_memory PROJECT"]
+        IDX[project_index\none-liner per well · always loaded]
+        ENT[entity_well\nfull detail · on demand]
+        LESS[project_lessons\ncross-session learnings]
+    end
+
+    subgraph UL ["User Layer — agent_memory USER"]
+        PROF[user_profile\ndepth unit · format · operator · wells]
+    end
+
+    subgraph PROC ["Procedural — permanent · human-authored"]
+        SKILL[AGENT.md · SKILL.md · SOUL.md]
+    end
+
+    CR -->|tail| TAIL
+    CC -->|compress| CR
+    CC -->|embed| RAG[(RAG CHAT index)]
+    CA -->|curate| CS
+    CS -.->|auto-inject| PB
+
+    CS -->|trigger| GATE
+    GATE -->|entity facts · verified| ENT
+    GATE -->|update one-liner| IDX
+    GATE -->|lessons| LESS
+    GATE -->|preferences observed| PROF
+
+    IDX -->|session start| PI
+    PROF -->|session start| UP
+    ENT -->|on demand\nwhen well mentioned| IC
+    SKILL -->|session start| IC
+```
+
+**Key differences from today:**
+- `chat.playbook` auto-injected every turn (not tool-called)
+- `ConsolidationAgent` promotes playbook findings to PROJECT + USER memory at session end
+- `project_index` + `user_profile` injected at session start — IDA remembers across sessions
+- Entity detail loaded on demand — context cost stays flat as project grows
+
+---
+
 ## Infrastructure: ContextCompressor
 
 Before addressing gaps, understanding ContextCompressor is essential — it underpins
@@ -81,7 +146,7 @@ flowchart TD
 
 | Bug | Impact | Severity |
 |---|---|---|
-| Cursor stored as GLOBAL scope | One `last_processed_chat_record_id` shared across all projects on the deployment — one project overwrites another's cursor | **High** |
+| No dedup on re-index | Restart re-processes already-embedded records — duplicate RAG embeddings degrade search ranking | **Medium** |
 | RAG indexes original, not compressed | After compression runs, RAG still holds the noisy original. Search returns degraded content | Medium |
 | No dedup on re-index | Restart creates duplicate RAG embeddings for the same records — degrades search ranking | Medium |
 | Sub-agents ignore `compressed_message` | Only `ida.py` reads `compressed_message or message`. All sub-agents read raw `message` — compression is invisible to them | Medium |
@@ -548,7 +613,7 @@ no data loss.
 
 | Gap | Layer | Severity | Depends on |
 |---|---|---|---|
-| **EP-1** Chat history tail-only, not searchable | Episodic | High | Fix CC cursor bug first |
+| **EP-1** Chat history tail-only, not searchable | Episodic | High | Fix CC dedup bug first |
 | **EP-2** No content search over agent_memory | Episodic | Medium | EX-5 schema |
 | **EP-3** No cross-chat retrieval | Episodic | Medium | EP-1 (`chat_id=None`) |
 | **EP-4** No end-of-session consolidation | Episodic → External | Medium | EX-5 schema |
@@ -563,7 +628,7 @@ no data loss.
 
 ```
 Phase 0 — Fix infrastructure bugs (prerequisite for everything)
-  ├── ContextCompressor cursor scope: GLOBAL → PROJECT
+  ├── ContextCompressor dedup check before re-embedding
   ├── ContextCompressor dedup check before re-embedding
   ├── ContextCompressor re-index with compressed_message when compression runs
   └── Staged data: make _extract_viz_and_data generic (EP-5)
