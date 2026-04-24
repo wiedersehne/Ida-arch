@@ -49,7 +49,7 @@ flowchart TD
 ```
 
 ### What works
-- Cheatsheet (`chat.playbook`) accumulates structured knowledge within a chat via dedicated curator LLM
+- Cheatsheet (`chat.playbook`) accumulates structured knowledge within a chat via dedicated curator LLM — three buckets: **key facts** (confirmed well characteristics, data quality), **data insights** (findings from tool results), **user habits** (preferences, conventions observed this session)
 - ContextCompressor indexes every USER + AGENT message into RAG (`source_type=CHAT`)
 - Chat record data toolbox gives structured access to staged results and visualizations
 - `agent_memory` DB table with PROJECT / ORG / GLOBAL scopes is built and operational
@@ -84,13 +84,13 @@ flowchart TD
         GATE["LLM gate: what is durable beyond this chat?\nentity fact · project lesson · user pref · discard"]
     end
 
-    subgraph PL ["Project Layer — agent_memory PROJECT"]
-        IDX[project_index\none-liner per well · always loaded]
-        ENT[entity_well\nfull detail · on demand]
+    subgraph PL ["Project Layer — agent_memory PROJECT · frozen snapshot"]
+        IDX[project_index\none-liner per well]
+        ENT[entity_well\nfull detail per well]
         LESS[project_lessons\ncross-session learnings]
     end
 
-    subgraph UL ["User Layer — agent_memory USER"]
+    subgraph UL ["User Layer — agent_memory USER · frozen snapshot"]
         PROF[user_profile\ndepth unit · format · operator · wells]
     end
 
@@ -110,17 +110,17 @@ flowchart TD
     GATE -->|lessons| LESS
     GATE -->|preferences observed| PROF
 
-    IDX -->|session start| PI
-    PROF -->|session start| UP
-    ENT -->|on demand\nwhen well mentioned| IC
+    IDX -->|session start\nfrozen snapshot| PI
+    ENT -->|session start\nfrozen snapshot| IC
+    PROF -->|session start\nfrozen snapshot| UP
     SKILL -->|session start| IC
 ```
 
 **Key differences from today:**
 - `chat.playbook` auto-injected every turn (not tool-called)
 - `ConsolidationAgent` promotes playbook findings to PROJECT + USER memory at session end
-- `project_index` + `user_profile` injected at session start — IDA remembers across sessions
-- Entity detail loaded on demand — context cost stays flat as project grows
+- All PROJECT + USER memory injected as frozen snapshots at session start — IDA remembers across sessions
+- Frozen snapshot preserves prefix cache (no retrieval overhead per turn)
 
 ---
 
@@ -146,9 +146,8 @@ flowchart TD
 
 | Bug | Impact | Severity |
 |---|---|---|
-| No dedup on re-index | Restart re-processes already-embedded records — duplicate RAG embeddings degrade search ranking | **Medium** |
-| RAG indexes original, not compressed | After compression runs, RAG still holds the noisy original. Search returns degraded content | Medium |
-| No dedup on re-index | Restart creates duplicate RAG embeddings for the same records — degrades search ranking | Medium |
+| No dedup on re-index | Restart re-processes already-embedded records — duplicate RAG embeddings degrade search ranking | Medium |
+| RAG indexes original, not compressed | After compression runs, RAG still holds the noisy original — search returns degraded content | Medium |
 | Sub-agents ignore `compressed_message` | Only `ida.py` reads `compressed_message or message`. All sub-agents read raw `message` — compression is invisible to them | Medium |
 | Two jobs share one cursor | A compression failure still advances the cursor — failed compressions are silently skipped forever | Low |
 
@@ -283,9 +282,10 @@ flowchart TD
 ```
 
 **Relationship to EX-3:**
-EX-3 handles *loading strategy* — how much to inject into context at session
-start. EP-2 handles *search* — how to query facts when the key is unknown or
-the query spans multiple entities. Both are needed: EX-3 for context efficiency,
+EX-3 handles *structure and budget* — what to store in PROJECT memory and how
+to keep each entry compact so the frozen snapshot stays within token budget.
+EP-2 handles *search* — how to query facts when the key is unknown or the query
+spans multiple entities. Both are needed: EX-3 for snapshot compactness,
 EP-2 for content discovery.
 
 ---
@@ -312,63 +312,18 @@ flowchart TD
     A[Session end trigger] --> B[Load chat.playbook\n+ last 20 records]
     B --> C[Consolidation LLM:\nWhat is durable beyond this chat?]
     C --> D{Per entry}
-    D -->|Entity finding| V{Verify against\nstaged source record}
+    D -->|Key fact / entity finding| V{Verify against\nstaged source record}
     V -->|Confirmed| E[→ agent_memory\nentity_NNM101\nscope=PROJECT\nconfidence=high]
     V -->|Not confirmed| EL[→ agent_memory\nconfidence=low\nflagged for review EX-4]
-    D -->|Project lesson| F[→ agent_memory\nproject_lessons\nscope=PROJECT]
-    D -->|Chat-specific| G[Stay in playbook only]
+    D -->|Data insight / project lesson| F[→ agent_memory\nproject_lessons\nscope=PROJECT]
+    D -->|User habit| UH[→ agent_memory\nuser_profile\nscope=USER]
+    D -->|Chat-specific / discard| G[Stay in playbook only]
 ```
 
 **Verification before write:** entity findings must be cross-checked against
 the staged source record from the same turn before promotion to `agent_memory`.
 An unverified fact written to PROJECT scope will surface confidently in future
 sessions — a wrong value is worse than a missing one.
-
----
-
-### EP-5 — Staged Data Only Written for Three Hardcoded Analysis Types
-
-**Current state:**
-`_extract_viz_and_data` in `datainsight.py` only stages results for three
-hardcoded context keys:
-
-| Context key | Staged as |
-|---|---|
-| `activity_well_results` | NPT/activity events per well |
-| `depth_well_results` | Progress/depth tables per well |
-| `cost_well_results` | Cost data per well |
-
-Any other analysis — WellView trajectory, formation tops, wellbore comparison,
-custom queries — produces no staged data. `subject_matter_expert.py` never
-writes staged data at all.
-
-**Impact on the follow-up question pattern:**
-When a user asks "what was X from that analysis?", the reliable fallback is
-`tool_get_record_data` fetching the previous turn's staged payload. This only
-works for the three types above. For everything else the agent falls back to
-the truncated chat tail (200 chars) — which will not preserve specific values.
-
-**Fix — extract tables from final message universally:**
-
-Rather than fixing each agent's context-key staging individually, extract
-markdown tables from the final response message at the point it is generated —
-regardless of which agent produced it. This covers `data_insight_agent`,
-`sme_agent`, and any future agent without per-agent changes.
-
-Implementation approach:
-- Add `_extract_tables_from_message(text) -> list[dict]` as a static method on
-  `AgentBase` — available to all agents
-- Each agent calls it on `final_message` before constructing the `ChatRecord`
-- Resulting table rows are merged into `staged` in `ChatRecordData`
-- For `data_insight_agent`, message tables complement context-key staged data
-  (structured JSON from context keys is richer; message tables are the fallback)
-- For `sme_agent`, this is the only staged data path — tables from document
-  answers become retrievable on follow-up
-
-The parser finds markdown table blocks (header row + separator row + data rows),
-parses each into a list of `{column: value}` dicts, and returns them as
-`{"description": "Table: col1, col2, ...", "data": [...]}` entries — the same
-shape as existing staged entries in `data_insight_agent`.
 
 ---
 
@@ -431,15 +386,20 @@ AGENT.md so they benefit from accumulated knowledge within the session.
 
 ### EX-2 — No User Profile
 
+**Implementation note:** EX-2 is not a new component. ConsolidationAgent (EP-4)
+already has a "user habits" bucket. EX-2 is a single routing change: write
+"user habits" to USER scope instead of PROJECT scope. Requires EX-5 USER scope
+(already in the schema migration) and a one-line update to the ConsolidationAgent
+prompt. The ~3 month timeline is soak time, not coding time.
+
 **Current state:**
 No persistent record of user preferences, depth units, operator conventions,
 or recurring workflows. Hermes solves this with `USER.md` (injected every
 session). Claude Code uses user-scoped CLAUDE.md.
 
 **Solution:**
-Store user profile in `agent_memory` (USER scope — requires schema change,
-see EX-5). Written when user states a preference or the agent detects a
-consistent pattern:
+ConsolidationAgent routes detected user habits to `agent_memory` (USER scope).
+Written when user states a preference or the agent detects a consistent pattern:
 
 ```python
 {
@@ -457,18 +417,28 @@ Expose as a user-editable panel equivalent to Hermes' `USER.md`.
 
 ---
 
-### EX-3 — No Progressive Memory Loading
+### EX-3 — No Structured Project Memory
+
+**Implementation note:** EX-3 is not a new component. It is a refinement of how
+ConsolidationAgent (EP-4) structures its PROJECT writes — one compact index entry
+per well + one entity detail record per well, both kept within token budget at
+write time. The ~3 month timeline is soak time to validate what structure actually
+works with real project data, not coding time.
 
 **Current state:**
 The full cheatsheet injects into context every turn regardless of query scope.
 As the project accumulates wells, context cost grows linearly.
 
-**Two-tier solution:**
+**Two-tier frozen snapshot:**
 
-*Tier 1 — Index (`chat.playbook`, always loaded, target < 500 tokens):*
+Once promoted to `agent_memory` PROJECT scope, both tiers are injected as
+frozen snapshots at every session start — no per-turn retrieval, prefix cache
+preserved. Token budget is enforced at *write time*.
+
+*Tier 1 — Project index (`agent_memory` PROJECT scope, key: `project_index`, target < 500 tokens):*
 ```markdown
 ### Active Wells
-- NNM-101: 45 days, NPT 12% — details: agent_memory:entity_NNM101
+- NNM-101: 45 days, NPT 12% — details: entity_NNM101
 - NNM-102: in progress
 
 ### Project Knowledge
@@ -479,7 +449,7 @@ As the project accumulates wells, context cost grows linearly.
 - tool_retrieve_data must precede tool_analyze_data
 ```
 
-*Tier 2 — Entity detail records (`agent_memory` PROJECT scope, on demand):*
+*Tier 2 — Entity detail records (`agent_memory` PROJECT scope, frozen snapshot):*
 ```python
 name = "entity_NNM101"
 scope = PROJECT
@@ -496,19 +466,10 @@ object = {
 }
 ```
 
-```mermaid
-flowchart TD
-    A[Session start] --> B[Tier 1: load index\n< 500 tokens always]
-    B --> C[User query]
-    C --> D{Mentions specific well?}
-    D -->|Yes| E[tool_read_memory\nentity_WELLNAME → Tier 2]
-    D -->|No| F[Index sufficient]
-    E --> G[Full well context in context]
-```
-
-**CheatsheetAgent write strategy:**
-- Every exchange → update Tier 1 index (entity name + one-liner only)
-- New Data Insight detected → upsert Tier 2 entity record in `agent_memory`
+**ConsolidationAgent write strategy:**
+- Session end → promote one-liner per well to Tier 1 `project_index` in `agent_memory`
+- Verified entity findings → upsert Tier 2 entity detail record in `agent_memory`
+- Each entry kept compact at write time — total PROJECT snapshot stays within token budget
 
 ---
 
@@ -595,15 +556,15 @@ no data loss.
 
 | Backend | What it adds | Dependency | IDA fit |
 |---|---|---|---|
-| **QMD** | Local-first sidecar, reranking, query expansion | External process | Re-evaluate if RAG search is too slow at scale |
-| **Honcho** | Cross-session user modeling, multi-agent awareness | Cloud service | Re-evaluate for multi-org deployments; data policy risk |
-| **Mem0** | Semantic memory graph, automatic fact extraction | Cloud / self-hosted | Re-evaluate if ConsolidationAgent (EP-4) entity extraction proves too complex |
-| **ChromaDB / Qdrant** | Dedicated vector DB, better ANN at scale | External process | Re-evaluate if PostgreSQL vector store bottlenecks |
+| **QMD** | Local-first sidecar, reranking, query expansion | External process | Re-evaluate if EP-2 FTS search quality is insufficient |
+| **Honcho** | Cross-session user modeling, multi-agent awareness | Cloud service | Re-evaluate if USER profile grows too complex for flat agent_memory records |
+| **Mem0** | Semantic memory graph, automatic fact extraction | Cloud / self-hosted | Re-evaluate if ConsolidationAgent entity extraction proves too complex |
+| **Qdrant / Weaviate** | Dedicated vector DB, high-throughput ANN at scale | External process | Re-evaluate if PostgreSQL RAG CHAT index hits performance limits |
 
 **Recommendation: defer all external backends.**
-- The RAG service already embeds all chat history. The gap is a missing filter, not a missing backend.
+- The RAG service already embeds all chat history. The gap is a missing retrieval tool, not a missing backend.
 - Drilling data is sensitive — cloud backends (Honcho, Mem0 cloud) require operator approval.
-- Fix the ContextCompressor cursor scope bug first. A broken cursor makes any search backend return incomplete results.
+- Fix the ContextCompressor dedup bug first — a duplicate-polluted index degrades any search backend.
 
 ---
 
@@ -617,47 +578,23 @@ no data loss.
 | **EP-2** No content search over agent_memory | Episodic | Medium | EX-5 schema |
 | **EP-3** No cross-chat retrieval | Episodic | Medium | EP-1 (`chat_id=None`) |
 | **EP-4** No end-of-session consolidation | Episodic → External | Medium | EX-5 schema |
-| **EP-5** Staged data only for 3 hardcoded types | Episodic | High | Independent |
 | **EX-1** Cheatsheet doesn't cross session boundaries | External | High | EP-4 + EX-5 |
 | **EX-2** No user profile | External | Medium | EX-5 schema (USER scope) |
-| **EX-3** No progressive memory loading | External | Medium | EP-4 + EX-5 |
+| **EX-3** No structured project memory | External | Low (future) | EP-4 + EX-5 |
 | **EX-4** Cheatsheet accuracy unverifiable | External | High | Independent |
 | **EX-5** agent_memory schema under-specified | External | Medium | Independent |
 
 ### Build Order
 
-```
-Phase 0 — Fix infrastructure bugs (prerequisite for everything)
-  ├── ContextCompressor dedup check before re-embedding
-  ├── ContextCompressor dedup check before re-embedding
-  ├── ContextCompressor re-index with compressed_message when compression runs
-  └── Staged data: make _extract_viz_and_data generic (EP-5)
-      + SME agent stages RAG excerpts
+| Timeline | Coding sprint | Deliverables | Validation (human-side) |
+|---|---|---|---|
+| **Day 1** | Fix CC bugs · EP-1 · EX-4 | CC dedup guard · `ChatHistoryService` · `tool_search_chat_history` · confidence tiers + source tagging in curator prompt | Restart service, confirm no duplicate embeddings · test follow-up question, verify history search returns relevant turns |
+| **Day 2–3** | EX-5 · EP-4 · EX-1 | Schema migration · ConsolidationAgent with LLM gate (key facts · data insights · user habits) · AGENT.md updates to read PROJECT memory at session start | Run 2–3 real sessions on a known well · inspect what ConsolidationAgent promoted · confirm next session starts with correct context |
+| **Weeks 2–4** | Tune ConsolidationAgent | Adjusted promotion threshold · playbook size cap · fix over/under-promotion | Review `agent_memory` after each session — is it durable and accurate? Flag false positives |
+| **~1 month** | EP-3 · EP-2 | Cross-chat retrieval · `tool_search_memory` FTS over `agent_memory` | Need enough data in `agent_memory` to validate search quality |
+| **~3 months** | EX-2 · EX-3 (small refinement) | Route "user habits" → USER scope · structure PROJECT writes into index + entity detail — both are ConsolidationAgent prompt + write-logic changes, not new components | Needs soak time first — enough sessions to confirm which habits actually recur and what entity structure works in practice |
+| **Long-term** | Backend evaluation | Honcho / QMD / Mem0 if limits hit | Operator data approval required for cloud backends |
 
-Phase 1 — Episodic retrieval (EP-1, EP-3)
-  ├── ChatHistoryService — centralize all agent history loading
-  └── tool_search_chat_history — RagService with source_type=CHAT filter
-
-Phase 2 — External persistence foundation (EX-5, EP-4, EX-1)
-  ├── Schema migration — add memory_type, user_id, content_text, confidence
-  ├── ConsolidationAgent — session-end trigger → PROJECT writes
-  └── Sub-agents read playbook — add tool_read_playbook to AGENT.md files
-
-Phase 3 — External memory features (EX-2, EX-3, EP-2)
-  ├── User profile — USER scope + preference detection
-  ├── Two-tier cheatsheet — index + entity detail records
-  └── tool_search_memory — FTS over agent_memory content_text
-
-Phase 4 — Quality and UX (EX-4)
-  ├── Source tagging + confidence tiers in curator prompt
-  └── /cheatsheet review UI
-
-Phase 5 — External backend evaluation (if needed)
-  └── QMD / Honcho — only if Phase 1–4 reveal scale or modeling limitations
-```
-
-**All phases use existing infrastructure.** No new DB tables or external backends
-required in Phases 0–4. Two key insights: ContextCompressor already embeds all
-chat history into RAG — EP-1 just needs a retrieval tool on top. And agent_memory
-already has the right scope model — EX-5 adds the columns needed to make it
-searchable and typed.
+The coding tasks on Day 1 and Day 2–3 are fast. The real time cost is the soak
+period (weeks 2–4) — ConsolidationAgent quality can only be validated with real
+well sessions, not in a coding session.
