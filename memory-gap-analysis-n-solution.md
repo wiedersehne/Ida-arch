@@ -57,6 +57,13 @@ flowchart TD
 ### What doesn't
 The architecture has no episodic retrieval path and no external persistence path. Everything resets between chats. Both the RAG index and `agent_memory` exist but are either incomplete or never written to by sub-agents.
 
+**Cheatsheet curator has two additional structural bugs that undermine extraction quality:**
+- **Wrong message priority** — `cheatsheet_agent.py:182` reads `message or compressed_message`, so the
+  curator always sees the raw noisy original. Should be `compressed_message or message` (same as `ida.py`).
+- **No scope boundary with tail window** — curator runs on every exchange including turns still in
+  the tail window, where the model already has the full raw text. The cheatsheet only adds value for
+  turns that have scrolled out. Curating in-tail turns creates redundant entries and wastes LLM calls.
+
 ---
 
 ## Proposed Architecture
@@ -473,27 +480,92 @@ object = {
 
 ---
 
-### EX-4 — Cheatsheet Accuracy Cannot Be Verified
+### EX-4 — Cheatsheet Quality and Verifiability
 
-**Current state:**
-The curator LLM can misinterpret data. Wrong values persist due to the
-APPEND-ONLY rule. No human review. No confidence tagging. No source tracing.
+**Current state — three structural problems:**
+
+**1. Wrong message input.** `cheatsheet_agent.py:182` reads `message or compressed_message` —
+the curator always receives the raw noisy original, never the 300-word compressed version.
+In practice `message` is always populated so `compressed_message` is never used. The curator
+must distill facts from full tool dumps, verbose Markdown tables, and boilerplate instead of
+a clean summary. The inverse of `ida.py`, which correctly reads `compressed_message or message`.
+
+**2. No scope boundary with the tail window.** The curator runs on every exchange including
+turns still in the tail window, where the model already has the raw text. The cheatsheet
+only adds value for turns that have scrolled out. The tail and cheatsheet should form a
+two-tier system with a clear boundary:
+
+| Tier | Scope | Content |
+|---|---|---|
+| Tail window | Last N turns | Exact exchange — recency anchor, model has full text |
+| Cheatsheet | Turns beyond tail | Distilled knowledge — what must not be forgotten |
+
+Running the curator on in-tail turns creates redundant entries and wastes LLM calls.
+The curator's job is to preserve what the tail can no longer hold, not to summarize
+what is already available.
+
+**3. No structured provenance.** The cheatsheet is stored and injected as plain text.
+There is no machine-readable source tag, no confidence field, and no conflict detection.
+Wrong values persist silently due to the APPEND-ONLY rule. ConsolidationAgent has no
+basis for distinguishing a value read verbatim from a tool result versus an inference
+from agent narrative.
+
+**Why this is the critical quality gate for the whole pipeline:**
+
+For long sessions the cheatsheet is the *only* record of early findings — turns outside the
+tail have no other representation in context. Errors compound: a wrong NPT value in the
+cheatsheet becomes a wrong `entity_NNM101` record that IDA cites confidently in future
+sessions. The quality bar is not "good enough for notes" but "accurate enough to anchor
+persistent memory." ConsolidationAgent quality is wholly dependent on this foundation.
 
 **Solutions:**
 
-1. **Source tagging** — tag each Data Insight entry with the chat record ID
-   it derived from. Enables tracing suspect values back to the source turn.
+**1. Fix message priority** (`cheatsheet_agent.py:182`) — `compressed_message or message`. One line.
 
-2. **Confidence tiers:**
-   - `[verified]` — value from a tool result with clear source
-   - `[inferred]` — derived by curator from partial data
-   - `[conflicted]` — conflicts with prior entry; both shown with sources
+**2. Scope curator to scrolled-out turns** — only process records with `id < tail_start_id`.
+Pass the current tail boundary to CheatsheetAgent. Eliminates in-tail redundancy and focuses
+extraction on turns that genuinely need preserving.
 
-3. **Cheatsheet review UI** — `/cheatsheet` command showing current content
-   with edit/delete, equivalent to Claude Code's `/memory`.
+**3. Structured JSON storage, rendered to markdown for injection.**
+Store each cheatsheet entry as a JSON object; the cheatsheet service renders clean markdown
+when injecting into context — same token cost as today. ConsolidationAgent reads the raw JSON
+and has everything it needs without re-parsing prose.
 
-4. **Conflict detection** — curator must surface conflicting values with
-   sources rather than silently resolving them.
+```json
+{
+  "bucket": "data_insights",
+  "content": "NPT total: 54.2 hrs (12.1%) — causes: stuck pipe, equipment failure",
+  "confidence": "verified",
+  "record_id": 847,
+  "well": "NNM-101"
+}
+```
+
+Consistent with the existing `agent_memory` JSONB pattern. XML adds no value over JSON here.
+
+**4. Confidence tiers baked into curator prompt**, written as structured fields:
+- `verified` — value appears verbatim in a tool result in the same exchange
+- `inferred` — derived from agent narrative or partial data
+- `conflicted` — contradicts an existing entry; both kept with source `record_id`, never resolved silently
+
+**5. Preserve numeric values verbatim.** Curator prompt must explicitly instruct: structured
+table values (NPT hours, ROP m/hr, depth, cost figures) are facts and must be copied exactly.
+"Significant NPT" is not a substitute for "54.2 hrs / 12.1%".
+
+**6. Conflict detection.** Before appending a new Data Insight entry for a well/metric already
+in the cheatsheet, curator checks for contradiction and emits a `conflicted` entry with both
+values and their source `record_id`s rather than silently appending.
+
+**ConsolidationAgent benefit:** with structured entries, ConsolidationAgent's verification
+logic is straightforward — `verified` entries promote directly, `inferred` entries trigger
+a cross-check against the staged source record before promotion. Without structured provenance,
+ConsolidationAgent must re-derive confidence from scratch on every entry.
+
+**Effort:** ~1 week coding + prompt iteration. Validation requires real well sessions —
+synthetic testing will not surface the key failure modes (paraphrased numbers, false
+inferences from agent narrative). Ongoing maintenance required as new data sources and skills
+are added, since the curator prompt must learn what new tool result shapes look like and
+which values to treat as facts.
 
 ---
 
@@ -581,20 +653,23 @@ no data loss.
 | **EX-1** Cheatsheet doesn't cross session boundaries | External | High | EP-4 + EX-5 |
 | **EX-2** No user profile | External | Medium | EX-5 schema (USER scope) |
 | **EX-3** No structured project memory | External | Low (future) | EP-4 + EX-5 |
-| **EX-4** Cheatsheet accuracy unverifiable | External | High | Independent |
+| **EX-4** Cheatsheet quality and verifiability | External | **Critical** | Independent — prerequisite for EP-4 |
 | **EX-5** agent_memory schema under-specified | External | Medium | Independent |
 
 ### Build Order
 
 | Timeline | Coding sprint | Deliverables | Validation (human-side) |
 |---|---|---|---|
-| **Day 1** | Fix CC bugs · EP-1 · EX-4 | CC dedup guard · `ChatHistoryService` · `tool_search_chat_history` · confidence tiers + source tagging in curator prompt | Restart service, confirm no duplicate embeddings · test follow-up question, verify history search returns relevant turns |
+| **Week 1** | **EX-4 — Cheatsheet foundation** | Fix message priority (`compressed_message or message`) · scope curator to scrolled-out turns only · JSON storage with markdown renderer · curator prompt: confidence tiers (`verified`/`inferred`/`conflicted`) + source `record_id` + preserve numeric values verbatim · conflict detection | Run real well sessions · inspect entries for numeric accuracy · verify `verified` entries trace to source tool results · check `inferred` entries are appropriately cautious · confirm no in-tail redundancy |
+| **Day 1** | Fix CC bugs · EP-1 | CC dedup guard · `ChatHistoryService` · `tool_search_chat_history` | Restart service, confirm no duplicate embeddings · test follow-up question, verify history search returns relevant turns |
 | **Day 2–3** | EX-5 · EP-4 · EX-1 | Schema migration · ConsolidationAgent with LLM gate (key facts · data insights · user habits) · AGENT.md updates to read PROJECT memory at session start | Run 2–3 real sessions on a known well · inspect what ConsolidationAgent promoted · confirm next session starts with correct context |
 | **Weeks 2–4** | Tune ConsolidationAgent | Adjusted promotion threshold · playbook size cap · fix over/under-promotion | Review `agent_memory` after each session — is it durable and accurate? Flag false positives |
 | **~1 month** | EP-3 · EP-2 | Cross-chat retrieval · `tool_search_memory` FTS over `agent_memory` | Need enough data in `agent_memory` to validate search quality |
 | **~3 months** | EX-2 · EX-3 (small refinement) | Route "user habits" → USER scope · structure PROJECT writes into index + entity detail — both are ConsolidationAgent prompt + write-logic changes, not new components | Needs soak time first — enough sessions to confirm which habits actually recur and what entity structure works in practice |
 | **Long-term** | Backend evaluation | Honcho / QMD / Mem0 if limits hit | Operator data approval required for cloud backends |
 
-The coding tasks on Day 1 and Day 2–3 are fast. The real time cost is the soak
-period (weeks 2–4) — ConsolidationAgent quality can only be validated with real
-well sessions, not in a coding session.
+**EX-4 is the prerequisite for everything downstream.** ConsolidationAgent (EP-4) can only
+promote reliable entries if the cheatsheet provenance is trustworthy. The Week 1 coding
+work is fast; the soak time is the real cost — curator quality can only be validated against
+real well sessions, and the prompt will need ongoing maintenance as new data sources and
+skills are added.
