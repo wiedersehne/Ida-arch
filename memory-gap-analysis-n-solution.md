@@ -22,7 +22,7 @@ This document covers **Episodic** and **External** gaps only.
 ```mermaid
 flowchart TD
     subgraph InContext ["In-Context — loaded at session start"]
-        CS[chat.playbook\ncheatsheet]
+        CS[chat.cheatsheet\ncheatsheet]
         UP[Uploaded files\nproject metadata]
     end
 
@@ -48,8 +48,48 @@ flowchart TD
     AM -->|cursor tracking only| CC
 ```
 
+### CheatsheetAgent — Detailed Flow
+
+```mermaid
+flowchart TD
+    A[Poll every 20s] --> B[Read starting_from_id\nfrom agent_memory GLOBAL]
+    B --> C[Fetch AGENT records\nid > starting_from_id · limit 50]
+    C --> D{Any new records?}
+    D -->|No| SLEEP[Sleep 20s]
+    SLEEP --> A
+    D -->|Yes| F[Group by chat_id\nkeep OLDEST agent record per chat]
+    F --> G[Compute tail_start_id\nget last 12 USER+AGENT records for chat]
+    G --> H{Fewer than 12\ntotal records?}
+    H -->|Yes| BYPASS[tail_start_id = sys.maxsize\nshort session — no tail guard]
+    H -->|No| I{Last activity\n> 1 hour ago?}
+    I -->|Yes — session idle| BYPASS
+    I -->|No — active session| J[tail_start_id = oldest of last 12 records]
+    J --> L{record.id >= tail_start_id?}
+    L -->|Yes — still in tail\nLLM has full text| SKIP[Skip\nwait for more exchanges]
+    SKIP --> SLEEP
+    L -->|No — scrolled out| N
+    BYPASS --> N[Find USER record\nimmediately before record.id]
+    N --> O{User query found?}
+    O -->|No| SKIP
+    O -->|Yes| Q[Get agent response\ncompressed_message or message]
+    Q --> R[Load chat.playbook\nJSON or '{}' if empty]
+    R --> S[LLM curator\nuser_query + model_answer\n+ previous_cheatsheet JSON]
+    S --> T[Extract JSON from\n&lt;cheatsheet&gt; tags]
+    T --> U[Save to chat.playbook]
+    U --> V[Advance starting_from_id\nto processed record.id]
+    V --> SLEEP
+```
+
+**Key behaviours:**
+- Processes one exchange per chat per poll cycle — oldest unprocessed, not newest
+- Tail guard (12 USER+AGENT records ≈ 6 exchanges) skips turns still in active context
+- Idle bypass: if last activity > 1 hour, tail guard is lifted and remaining exchanges are curated
+- Output stored as structured JSON (`data_insights` / `key_facts` / `user_habits`); rendered to markdown for context injection
+
+---
+
 ### What works
-- Cheatsheet (`chat.playbook`) accumulates structured knowledge within a chat via dedicated curator LLM — three buckets: **key facts** (confirmed well characteristics, data quality), **data insights** (findings from tool results), **user habits** (preferences, conventions observed this session)
+- Cheatsheet (`chat.cheatsheet`) accumulates structured knowledge within a chat via dedicated curator LLM — three buckets: **key facts** (confirmed well characteristics, data quality), **data insights** (findings from tool results), **user habits** (preferences, conventions observed this session)
 - ContextCompressor indexes every USER + AGENT message into RAG (`source_type=CHAT`)
 - Chat record data toolbox gives structured access to staged results and visualizations
 - `agent_memory` DB table with PROJECT / ORG / GLOBAL scopes is built and operational
@@ -72,14 +112,14 @@ The architecture has no episodic retrieval path and no external persistence path
 flowchart TD
     subgraph IC ["In-Context — injected every turn"]
         TAIL[Last 12 messages\ncompressed_message or message]
-        PB[chat.playbook\nauto-injected by orchestrator]
+        PB[chat.cheatsheet\nauto-injected by orchestrator]
         PI[project_index\n< 500 tokens · one-liner per well]
         UP[user_profile\n< 200 tokens · prefs + conventions]
     end
 
     subgraph SL ["Session Layer — chat-scoped"]
         CR[(chat_record\nfull history)]
-        CS[chat.playbook\nCheatsheetAgent 20s]
+        CS[chat.cheatsheet\nCheatsheetAgent 20s]
     end
 
     subgraph BG ["Background"]
@@ -124,8 +164,8 @@ flowchart TD
 ```
 
 **Key differences from today:**
-- `chat.playbook` auto-injected every turn (not tool-called)
-- `ConsolidationAgent` promotes playbook findings to PROJECT + USER memory at session end
+- `chat.cheatsheet` auto-injected every turn (not tool-called)
+- `ConsolidationAgent` promotes cheatsheet findings to PROJECT + USER memory at session end
 - All PROJECT + USER memory injected as frozen snapshots at session start — IDA remembers across sessions
 - Frozen snapshot preserves prefix cache (no retrieval overhead per turn)
 
@@ -304,6 +344,52 @@ project-wide search across all chats using existing RAG embeddings.
 
 ---
 
+### EP-5 — No Context Overflow Handling
+
+**Current state:**
+IDA has no mechanism to detect or handle a full context window. A sufficiently long session
+will hit the token limit and fail. The ContextCompressor and cheatsheet delay this by
+compressing messages and distilling knowledge, but they do not eliminate the limit.
+
+The in-context budget has fixed and variable components:
+
+| Component | Type | Notes |
+|---|---|---|
+| SOUL.md, AGENT.md, SKILL.md | Fixed overhead | Always reloaded — no carry-over needed |
+| Uploaded files / project metadata | Fixed per session | Re-referenced from DB |
+| PROJECT memory snapshot | Fixed per session | Reloaded from `agent_memory` |
+| Cheatsheet (`chat.cheatsheet`) | Grows with session | Must be promoted and carried over |
+| Chat history tail | Grows with session | Most recent turns must seed the new session |
+
+**Solution — context budget monitor + mid-session ConsolidationAgent trigger:**
+
+```mermaid
+flowchart TD
+    A[Each turn: estimate token usage\nSOUL + AGENT + SKILL + tail + cheatsheet + PROJECT snapshot] --> B{Approaching limit?\n~80% of context window}
+    B -->|No| C[Continue normally]
+    B -->|Yes| D[Trigger ConsolidationAgent\nmid-session mode]
+    D --> E[Promote cheatsheet findings\nto PROJECT memory]
+    E --> F[Open new chat session]
+    F --> G[Inject: PROJECT snapshot\n+ promoted cheatsheet\n+ last N turns as seed context]
+    G --> H[Notify user:\nsession continued seamlessly]
+```
+
+**Two trigger conditions for ConsolidationAgent:**
+1. End-of-session (30-min inactivity, existing EP-4) — clean boundary, full promotion
+2. Context overflow (approaching token limit) — forced mid-session, conservative promotion
+
+**Conservative promotion on overflow:** at mid-session the conversation is incomplete.
+Only `verified` entries promote. `inferred` entries are written with `confidence = 0.4`
+and flagged — the session was cut short before they could be confirmed. The new session
+seeds from PROJECT memory, so verified facts are immediately available; inferred findings
+surface in the cheatsheet as low-confidence entries for the user to confirm.
+
+**Seed context for new session:** carry the last 12 turns from the old session as the
+opening tail of the new session. This preserves immediate conversational continuity —
+the user should not notice the session boundary unless they look for it.
+
+---
+
 ### EP-4 — No End-of-Session Consolidation
 
 **Current state:**
@@ -316,7 +402,7 @@ session close or 30-minute inactivity):
 
 ```mermaid
 flowchart TD
-    A[Session end trigger] --> B[Load chat.playbook\n+ last 20 records]
+    A[Session end trigger] --> B[Load chat.cheatsheet\n+ last 20 records]
     B --> C[Consolidation LLM:\nWhat is durable beyond this chat?]
     C --> D{Per entry}
     D -->|Key fact / entity finding| V{Verify against\nstaged source record}
@@ -324,7 +410,7 @@ flowchart TD
     V -->|Not confirmed| EL[→ agent_memory\nconfidence=low\nflagged for review EX-4]
     D -->|Data insight / project lesson| F[→ agent_memory\nproject_lessons\nscope=PROJECT]
     D -->|User habit| UH[→ agent_memory\nuser_profile\nscope=USER]
-    D -->|Chat-specific / discard| G[Stay in playbook only]
+    D -->|Chat-specific / discard| G[Stay in cheatsheet only]
 ```
 
 **Verification before write:** entity findings must be cross-checked against
@@ -341,13 +427,13 @@ External memory = persistent structured storage reused across sessions.
 ### EX-1 — Cheatsheet Does Not Cross Session Boundaries
 
 **Current state:**
-The cheatsheet (`chat.playbook`) is scoped to a single chat. A new chat in
+The cheatsheet (`chat.cheatsheet`) is scoped to a single chat. A new chat in
 the same project starts blank. PROJECT-scoped `agent_memory` exists but
 nothing writes to it. IDA forgets everything between sessions.
 
-**Additional insight — sub-agents don't read the playbook either:**
+**Additional insight — sub-agents don't read the cheatsheet either:**
 Even within a session, only the orchestrator (`ida_agent`) references
-`tool_read_playbook`. Sub-agents (`data_insight_agent`, `sme_agent`, etc.)
+`tool_read_cheatsheet`. Sub-agents (`data_insight_agent`, `sme_agent`, etc.)
 never load the cheatsheet. The curated knowledge is only used by the
 orchestrator's planning step — not by the agents doing the actual work.
 
@@ -356,11 +442,11 @@ orchestrator's planning step — not by the agents doing the actual work.
 ```mermaid
 flowchart TD
     subgraph Session1 ["Session N"]
-        S1A[Turn-by-turn exchange] -->|CheatsheetAgent 20s poll| S1B[chat.playbook\nper-chat cheatsheet]
+        S1A[Turn-by-turn exchange] -->|CheatsheetAgent 20s poll| S1B[chat.cheatsheet\nper-chat cheatsheet]
     end
 
     subgraph Session2 ["Session N+1"]
-        S2A[Turn-by-turn exchange] -->|CheatsheetAgent 20s poll| S2B[chat.playbook\nper-chat cheatsheet]
+        S2A[Turn-by-turn exchange] -->|CheatsheetAgent 20s poll| S2B[chat.cheatsheet\nper-chat cheatsheet]
     end
 
     S1B -->|session close / 30-min inactivity| CONS[ConsolidationAgent\nDistill: what is durable\nbeyond this chat?]
@@ -368,12 +454,12 @@ flowchart TD
 
     CONS -->|entity finding| AM1[agent_memory\nentity_NNM101\nscope=PROJECT]
     CONS -->|project lesson| AM2[agent_memory\nproject_lessons\nscope=PROJECT]
-    CONS -->|chat-specific| DISC[Discard —\nstays in playbook only]
+    CONS -->|chat-specific| DISC[Discard —\nstays in cheatsheet only]
 
     AM1 --> INJECT
     AM2 --> INJECT
     INJECT[Session-start injection\ntool_read_memory PROJECT] -->|orchestrator plan step| ORC[ida_agent\nplanning with prior knowledge]
-    INJECT -->|tool_read_playbook in AGENT.md| SUB[sub-agents\ndata_insight / sme / viz]
+    INJECT -->|tool_read_cheatsheet in AGENT.md| SUB[sub-agents\ndata_insight / sme / viz]
 ```
 
 *Session persistence* — ConsolidationAgent (EP-4) writes to PROJECT-scoped
@@ -386,7 +472,7 @@ answering first query:
 tool_read_memory(name="entity_<well>", scope=PROJECT, project_id=...)
 ```
 
-*Sub-agent access* — add `tool_read_playbook` call to each sub-agent's
+*Sub-agent access* — add `tool_read_cheatsheet` call to each sub-agent's
 AGENT.md so they benefit from accumulated knowledge within the session.
 
 ---
@@ -527,21 +613,39 @@ Pass the current tail boundary to CheatsheetAgent. Eliminates in-tail redundancy
 extraction on turns that genuinely need preserving.
 
 **3. Structured JSON storage, rendered to markdown for injection.**
-Store each cheatsheet entry as a JSON object; the cheatsheet service renders clean markdown
-when injecting into context — same token cost as today. ConsolidationAgent reads the raw JSON
-and has everything it needs without re-parsing prose.
+Store the cheatsheet as a nested JSON object keyed by bucket; the cheatsheet service renders
+clean markdown when injecting into context — same token cost as today. ConsolidationAgent
+reads each bucket independently without re-parsing prose.
 
 ```json
 {
-  "bucket": "data_insights",
-  "content": "NPT total: 54.2 hrs (12.1%) — causes: stuck pipe, equipment failure",
-  "confidence": "verified",
-  "record_id": 847,
-  "well": "NNM-101"
+  "data_insights": [
+    {
+      "content": "NPT total: 54.2 hrs (12.1%) — causes: stuck pipe, equipment failure",
+      "confidence": "verified",
+      "record_id": 847,
+      "well": "NNM-101"
+    }
+  ],
+  "key_facts": [
+    {
+      "content": "WellView exports use metres for this project",
+      "confidence": "verified",
+      "record_id": 801
+    }
+  ],
+  "user_habits": [
+    {
+      "content": "User prefers concise tables over narrative summaries",
+      "confidence": "inferred",
+      "record_id": 815
+    }
+  ]
 }
 ```
 
-Consistent with the existing `agent_memory` JSONB pattern. XML adds no value over JSON here.
+`well` is present only on `data_insights` entries — it is entity-specific. `key_facts` and
+`user_habits` omit it. Consistent with the existing `agent_memory` JSONB pattern.
 
 **4. Confidence tiers baked into curator prompt**, written as structured fields:
 - `verified` — value appears verbatim in a tool result in the same exchange
@@ -650,6 +754,7 @@ no data loss.
 | **EP-2** No content search over agent_memory | Episodic | Medium | EX-5 schema |
 | **EP-3** No cross-chat retrieval | Episodic | Medium | EP-1 (`chat_id=None`) |
 | **EP-4** No end-of-session consolidation | Episodic → External | Medium | EX-5 schema |
+| **EP-5** No context overflow handling | Episodic → External | High | EP-4 (same ConsolidationAgent, second trigger) |
 | **EX-1** Cheatsheet doesn't cross session boundaries | External | High | EP-4 + EX-5 |
 | **EX-2** No user profile | External | Medium | EX-5 schema (USER scope) |
 | **EX-3** No structured project memory | External | Low (future) | EP-4 + EX-5 |
@@ -663,7 +768,7 @@ no data loss.
 | **Week 1** | **EX-4 — Cheatsheet foundation** | Fix message priority (`compressed_message or message`) · scope curator to scrolled-out turns only · JSON storage with markdown renderer · curator prompt: confidence tiers (`verified`/`inferred`/`conflicted`) + source `record_id` + preserve numeric values verbatim · conflict detection | Run real well sessions · inspect entries for numeric accuracy · verify `verified` entries trace to source tool results · check `inferred` entries are appropriately cautious · confirm no in-tail redundancy |
 | **Day 1** | Fix CC bugs · EP-1 | CC dedup guard · `ChatHistoryService` · `tool_search_chat_history` | Restart service, confirm no duplicate embeddings · test follow-up question, verify history search returns relevant turns |
 | **Day 2–3** | EX-5 · EP-4 · EX-1 | Schema migration · ConsolidationAgent with LLM gate (key facts · data insights · user habits) · AGENT.md updates to read PROJECT memory at session start | Run 2–3 real sessions on a known well · inspect what ConsolidationAgent promoted · confirm next session starts with correct context |
-| **Weeks 2–4** | Tune ConsolidationAgent | Adjusted promotion threshold · playbook size cap · fix over/under-promotion | Review `agent_memory` after each session — is it durable and accurate? Flag false positives |
+| **Weeks 2–4** | Tune ConsolidationAgent | Adjusted promotion threshold · cheatsheet size cap · fix over/under-promotion | Review `agent_memory` after each session — is it durable and accurate? Flag false positives |
 | **~1 month** | EP-3 · EP-2 | Cross-chat retrieval · `tool_search_memory` FTS over `agent_memory` | Need enough data in `agent_memory` to validate search quality |
 | **~3 months** | EX-2 · EX-3 (small refinement) | Route "user habits" → USER scope · structure PROJECT writes into index + entity detail — both are ConsolidationAgent prompt + write-logic changes, not new components | Needs soak time first — enough sessions to confirm which habits actually recur and what entity structure works in practice |
 | **Long-term** | Backend evaluation | Honcho / QMD / Mem0 if limits hit | Operator data approval required for cloud backends |
@@ -673,3 +778,6 @@ promote reliable entries if the cheatsheet provenance is trustworthy. The Week 1
 work is fast; the soak time is the real cost — curator quality can only be validated against
 real well sessions, and the prompt will need ongoing maintenance as new data sources and
 skills are added.
+
+See `docs/memory-implementation-plan.md` for the detailed task-by-task plan with per-week
+deliverables, validation criteria, and risk register.
