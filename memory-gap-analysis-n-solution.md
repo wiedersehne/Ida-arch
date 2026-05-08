@@ -72,7 +72,7 @@ flowchart TD
     N --> O{User query found?}
     O -->|No| SKIP
     O -->|Yes| Q[Get agent response\ncompressed_message or message]
-    Q --> R[Load chat.playbook\nJSON or '{}' if empty]
+    Q --> R[Load chat.playbook\nJSON string, empty if new]
     R --> S[LLM curator\nuser_query + model_answer\n+ previous_cheatsheet JSON]
     S --> T[Extract JSON from\n&lt;cheatsheet&gt; tags]
     T --> U[Save to chat.playbook]
