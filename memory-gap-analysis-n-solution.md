@@ -38,7 +38,7 @@ flowchart TD
     subgraph Background ["Background agents"]
         CA[CheatsheetAgent\n20s poll]
         CC[ContextCompressor\n5s poll]
-        HA[HabitAgent\n60s poll · session end]
+        HA[HabitAgent\n5min poll · session end]
     end
 
     CC -->|embed ALL messages| RAG
@@ -102,7 +102,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Poll every 60s] --> B[Read global_cursor\nfrom agent_memory GLOBAL]
+    A[Poll every 5min] --> B[Read global_cursor\nfrom agent_memory GLOBAL]
     B --> C[Fetch AGENT RESPONSE records\nid > global_cursor · limit 100]
     C --> D{Any new records?}
     D -->|No| SLEEP[Sleep 60s]
