@@ -38,6 +38,7 @@ flowchart TD
     subgraph Background ["Background agents"]
         CA[CheatsheetAgent\n20s poll]
         CC[ContextCompressor\n5s poll]
+        HA[HabitAgent\n60s poll · session end]
     end
 
     CC -->|embed ALL messages| RAG
@@ -46,53 +47,109 @@ flowchart TD
     CS -->|injected at start| InContext
     AM -->|cursor tracking only| CA
     AM -->|cursor tracking only| CC
+    AM -->|cursor tracking only| HA
+    HA -->|write habit profile\nat session end| CH[chat.habit]
 ```
 
 ### CheatsheetAgent — Detailed Flow
 
 ```mermaid
 flowchart TD
-    A[Poll every 20s] --> B[Read starting_from_id\nfrom agent_memory GLOBAL]
-    B --> C[Fetch AGENT records\nid > starting_from_id · limit 50]
+    A[Poll every 20s] --> B[Read last_processed_chat_record_id\nfrom agent_memory GLOBAL]
+    B --> C[Fetch AGENT RESPONSE records\nid > starting_from_id · limit 50]
     C --> D{Any new records?}
     D -->|No| SLEEP[Sleep 20s]
     SLEEP --> A
-    D -->|Yes| F[Group by chat_id\nkeep OLDEST agent record per chat]
-    F --> G[Compute tail_start_id\nget last 12 USER+AGENT records for chat]
-    G --> H{Fewer than 12\ntotal records?}
+    D -->|Yes| F[Group by chat_id\nkeep OLDEST unprocessed agent record per chat]
+    F --> G[Compute tail_start_id\nfetch last TAIL_WINDOW_SIZE+1 AGENT RESPONSE records for chat]
+    G --> H{≤ TAIL_WINDOW_SIZE\ncomplete exchanges?}
     H -->|Yes| BYPASS[tail_start_id = sys.maxsize\nshort session — no tail guard]
-    H -->|No| I{Last activity\n> 1 hour ago?}
+    H -->|No| I{Last AGENT RESPONSE\n> 1 hour ago?}
     I -->|Yes — session idle| BYPASS
-    I -->|No — active session| J[tail_start_id = oldest of last 12 records]
+    I -->|No — active session| J[tail_start_id = oldest of last\nTAIL_WINDOW_SIZE agent responses]
     J --> L{record.id >= tail_start_id?}
-    L -->|Yes — still in tail\nLLM has full text| SKIP[Skip\nwait for more exchanges]
+    L -->|Yes — still in tail| SKIP[Skip — wait for more exchanges]
     SKIP --> SLEEP
     L -->|No — scrolled out| N
-    BYPASS --> N[Find USER record\nimmediately before record.id]
+    BYPASS --> N[Find most recent USER record\nbefore record.id in last 20 USER records]
     N --> O{User query found?}
     O -->|No| SKIP
-    O -->|Yes| Q[Get agent response\ncompressed_message or message]
-    Q --> R[Load chat.playbook\nJSON string, empty if new]
+    O -->|Yes| Q[Get agent response\nmessage or compressed_message\nraw first — curator needs tool result blocks]
+    Q --> R[Load current cheatsheet JSON\nvia CheatsheetService]
     R --> S[LLM curator\nuser_query + model_answer\n+ previous_cheatsheet JSON]
     S --> T[Extract JSON from\n&lt;cheatsheet&gt; tags]
-    T --> U[Save to chat.playbook]
-    U --> V[Advance starting_from_id\nto processed record.id]
+    T --> U[Save to chat.cheatsheet\nvia CheatsheetService]
+    U --> V[Advance last_processed_chat_record_id\nto max processed record.id]
     V --> SLEEP
 ```
 
 **Key behaviours:**
-- Processes one exchange per chat per poll cycle — oldest unprocessed, not newest
-- Tail guard (12 USER+AGENT records ≈ 6 exchanges) skips turns still in active context
-- Idle bypass: if last activity > 1 hour, tail guard is lifted and remaining exchanges are curated
-- Output stored as structured JSON (`data_insights` / `key_facts` / `user_habits`); rendered to markdown for context injection
+- Processes one exchange per chat per poll cycle — oldest unprocessed exchange, not newest
+- Tail guard (`TAIL_WINDOW_SIZE=2` AGENT RESPONSE records) skips exchanges still in active context window
+- Idle bypass: if last AGENT RESPONSE > 1 hour ago, tail guard lifts — remaining tail exchanges are curated
+- Curator receives raw `message` (not `compressed_message`) so it can detect `verified` vs `inferred` confidence from tool result blocks
+- Output stored as structured JSON (`data_insights` / `key_facts`); rendered to markdown for context injection
+- Both cheatsheet and habits accumulate across re-entries: curator carries all previous entries forward and only appends or marks conflicts — nothing is replaced
+
+**Re-entry behaviour (user returns after idle):**
+- Tail guard re-evaluates dynamically on each poll against the most recent AGENT RESPONSE records
+- When user returns and new exchanges arrive, tail guard re-establishes around the new session's records
+- New exchanges are processed in order as they scroll past the tail boundary — seamless continuation
+
+---
+
+### HabitAgent — Detailed Flow
+
+```mermaid
+flowchart TD
+    A[Poll every 60s] --> B[Read global_cursor\nfrom agent_memory GLOBAL]
+    B --> C[Fetch AGENT RESPONSE records\nid > global_cursor · limit 100]
+    C --> D{Any new records?}
+    D -->|No| SLEEP[Sleep 60s]
+    SLEEP --> A
+    D -->|Yes| E[Keep LATEST agent response\nper chat_id]
+    E --> F{Latest response\n> 1 hour ago?}
+    F -->|No — still active| SKIP[Skip chat\nnot idle yet]
+    SKIP --> NEXT
+    F -->|Yes — session idle| G{latest_id > chat_cursor\nfor this chat?}
+    G -->|No — already processed| SKIP
+    G -->|Yes — new exchanges| H[Fetch USER records since chat_cursor\nlimit 200 · no msg_role filter]
+    H --> I[Fetch AGENT RESPONSE records\nsince chat_cursor · limit 200]
+    I --> J[Merge and sort by id\nbuild transcript: User/Assistant turns]
+    J --> K[Load chat.habit\nexisting habit profile or none]
+    K --> L[LLM: session transcript\n+ existing habits]
+    L --> M[Extract from &lt;habits&gt; tags\n5 dimensions: QUERY STYLE · INTERACTION STYLE\nOUTPUT PREFERENCES · DOMAIN FOCUS · EXPERTISE SIGNALS]
+    M --> N{New habits\nnon-empty?}
+    N -->|No| CURSOR
+    N -->|Yes| O[Write to chat.habit\nvia ProjectService.update_chat_habit]
+    O --> CURSOR[Advance chat_cursor\nto latest_id]
+    CURSOR --> NEXT[Advance global_cursor\nto max seen id across all chats]
+    NEXT --> SLEEP
+```
+
+**Key behaviours:**
+- Per-session trigger: fires once per chat per idle period, not per exchange
+- Idle detection: AGENT RESPONSE timestamp > `IDLE_THRESHOLD` (1 hour) — same threshold as CheatsheetAgent's idle bypass
+- Two-cursor design: global cursor (efficiency filter — skip already-seen record IDs) + per-chat cursor (correctness — tracks what was processed for habit extraction)
+- Transcript assembly fetches USER and AGENT records in separate queries (USER records have no `msg_role` field) then merges by ID
+- Habit profile written to `chat.habit` — per-chat storage; ConsolidationAgent later reads all `chat.habit` entries and promotes to USER-scoped `agent_memory`
+- Output format: structured text with `## DIMENSION` headers (QUERY STYLE / INTERACTION STYLE / OUTPUT PREFERENCES / DOMAIN FOCUS / EXPERTISE SIGNALS)
+- Update strategy: confirms → unchanged, strengthens → mark confirmed, contradicts → soften, new → add. Nothing is replaced.
+
+**Re-entry behaviour (user returns after idle):**
+- New AGENT RESPONSE records arrive with IDs > chat_cursor → `_has_new_records` returns True
+- But `_is_idle` returns False (latest response is recent) → chat is skipped
+- Second idle: HabitAgent processes only new exchanges since the chat cursor, loads `chat.habit` as existing context, incrementally refines the profile
+- The first session's habits survive unless directly contradicted by the new session
 
 ---
 
 ### What works
-- Cheatsheet (`chat.cheatsheet`) accumulates structured knowledge within a chat via dedicated curator LLM — three buckets: **key facts** (confirmed well characteristics, data quality), **data insights** (findings from tool results), **user habits** (preferences, conventions observed this session)
+- Cheatsheet (`chat.cheatsheet`) accumulates structured knowledge within a chat via dedicated curator LLM — two buckets: **key facts** (confirmed well characteristics, data quality) and **data insights** (findings from tool results with `verified`/`inferred`/`conflicted` confidence)
+- HabitAgent (`chat.habit`) extracts behavioural preferences per session end — five dimensions: query style, interaction style, output preferences, domain focus, expertise signals; written to `chat.habit`, ready for ConsolidationAgent to promote to USER-scoped `agent_memory`
 - ContextCompressor indexes every USER + AGENT message into RAG (`source_type=CHAT`)
 - Chat record data toolbox gives structured access to staged results and visualizations
-- `agent_memory` DB table with PROJECT / ORG / GLOBAL scopes is built and operational
+- `agent_memory` DB table with PROJECT / ORG / USER / GLOBAL scopes is built and operational
 
 ### What doesn't
 The architecture has no episodic retrieval path and no external persistence path. Everything resets between chats. Both the RAG index and `agent_memory` exist but are either incomplete or never written to by sub-agents.
