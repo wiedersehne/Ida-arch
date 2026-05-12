@@ -96,6 +96,9 @@ flowchart TD
 - When user returns and new exchanges arrive, tail guard re-establishes around the new session's records
 - New exchanges are processed in order as they scroll past the tail boundary — seamless continuation
 
+**Known structural bug — global cursor race:**
+When a poll batch contains records from multiple chats (e.g. Chat A records [10, 30] and Chat B record [40]), the agent picks the oldest per chat (Chat A → 10, Chat B → 40), processes both, then advances the global cursor to `max(10, 40) = 40`. Chat A's record 30 was visible in the batch but not chosen — it is now below the cursor and permanently lost. The cursor encodes global ordering but decisions are per-chat, making the two incompatible.
+
 ---
 
 ### HabitAgent — Detailed Flow
@@ -716,6 +719,41 @@ table values (NPT hours, ROP m/hr, depth, cost figures) are facts and must be co
 **6. Conflict detection.** Before appending a new Data Insight entry for a well/metric already
 in the cheatsheet, curator checks for contradiction and emits a `conflicted` entry with both
 values and their source `record_id`s rather than silently appending.
+
+**7. Redesign trigger and cursor mechanism — event-driven + per-chat cursor in `chat` table.**
+
+Current approach (polling + global cursor in `agent_memory`) has three problems: up to 20s
+latency before cheatsheet updates, the global cursor race bug described above, and misuse of
+`agent_memory` as a bookkeeping store. Proposed replacement:
+
+| | Current | Proposed |
+|--|---------|----------|
+| Trigger | Poll every 20s | Message bus event on each new AGENT RESPONSE |
+| Cursor store | `agent_memory` GLOBAL (single global ID) | `chat.cheatsheet_cursor` column (per-chat INT) |
+| Cursor correctness | Broken — cross-chat race | Correct — per-chat, no cross-contamination |
+| Latency | Up to 20s | Immediate |
+| Missed-event recovery | Automatic (poll-based) | Fallback poll reads per-chat cursor |
+| Schema change | None | One column on `chat` (same pattern as `chat.habit`) |
+
+**Trigger:** `ida_agent` publishes a lightweight message to the existing bus after writing each
+AGENT RESPONSE. CheatsheetAgent subscribes and wakes immediately with `chat_id, project_id,
+record_id` — no cursor read needed on the hot path.
+
+**Fallback:** IDA's message bus is in-memory. On restart, missed events are recovered by a
+low-frequency fallback poll (e.g. every 5 minutes) that queries per-chat cursors:
+
+```sql
+SELECT c.id, c.project_id, MAX(cr.id) AS latest_id
+FROM chat c
+JOIN chat_record cr ON cr.chat_id = c.id
+WHERE cr.sender_role = 'AGENT' AND cr.msg_role = 'RESPONSE'
+  AND cr.id > c.cheatsheet_cursor
+GROUP BY c.id, c.project_id
+```
+
+**Per-chat cursor update:** after processing chat N's exchange, write `latest_id` back to
+`chat.cheatsheet_cursor` for chat N only. No other chat's cursor is touched — the race
+condition cannot occur.
 
 **ConsolidationAgent benefit:** with structured entries, ConsolidationAgent's verification
 logic is straightforward — `verified` entries promote directly, `inferred` entries trigger
