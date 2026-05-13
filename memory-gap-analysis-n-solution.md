@@ -35,8 +35,13 @@ flowchart TD
         AM[(agent_memory\nGLOBAL scope only\nbookkeeping)]
     end
 
+    subgraph ChatCursors ["Per-chat cursors — chat table"]
+        CTC[chat.cheatsheet_cursor_ts\ntimestamp]
+        CHC[chat.habit_cursor_ts\ntimestamp]
+    end
+
     subgraph Background ["Background agents"]
-        CA[CheatsheetAgent\n20s poll]
+        CA[CheatsheetAgent\nevent-driven · 120s fallback poll]
         CC[ContextCompressor\n5s poll]
         HA[HabitAgent\n5min poll · session end]
     end
@@ -45,9 +50,9 @@ flowchart TD
     CC -->|summarize >2000 chars| CD
     CA -->|curate per exchange| CS
     CS -->|injected at start| InContext
-    AM -->|cursor tracking only| CA
     AM -->|cursor tracking only| CC
-    AM -->|cursor tracking only| HA
+    CA <-->|read/write cursor| CTC
+    HA <-->|read/write cursor| CHC
     HA -->|write habit profile\nat session end| CH[chat.habit]
 ```
 
@@ -55,49 +60,50 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Poll every 20s] --> B[Read last_processed_chat_record_id\nfrom agent_memory GLOBAL]
-    B --> C[Fetch AGENT RESPONSE records\nid > starting_from_id · limit 50]
-    C --> D{Any new records?}
-    D -->|No| SLEEP[Sleep 20s]
-    SLEEP --> A
-    D -->|Yes| F[Group by chat_id\nkeep OLDEST unprocessed agent record per chat]
-    F --> G[Compute tail_start_id\nfetch last TAIL_WINDOW_SIZE+1 AGENT RESPONSE records for chat]
-    G --> H{≤ TAIL_WINDOW_SIZE\ncomplete exchanges?}
-    H -->|Yes| BYPASS[tail_start_id = sys.maxsize\nshort session — no tail guard]
-    H -->|No| I{Last AGENT RESPONSE\n> 1 hour ago?}
-    I -->|Yes — session idle| BYPASS
-    I -->|No — active session| J[tail_start_id = oldest of last\nTAIL_WINDOW_SIZE agent responses]
-    J --> L{record.id >= tail_start_id?}
-    L -->|Yes — still in tail| SKIP[Skip — wait for more exchanges]
-    SKIP --> SLEEP
-    L -->|No — scrolled out| N
-    BYPASS --> N[Find most recent USER record\nbefore record.id in last 20 USER records]
-    N --> O{User query found?}
-    O -->|No| SKIP
-    O -->|Yes| Q[Get agent response\nmessage or compressed_message\nraw first — curator needs tool result blocks]
-    Q --> R[Load current cheatsheet JSON\nvia CheatsheetService]
-    R --> S[LLM curator\nuser_query + model_answer\n+ previous_cheatsheet JSON]
-    S --> T[Extract JSON from\n&lt;cheatsheet&gt; tags]
-    T --> U[Save to chat.cheatsheet\nvia CheatsheetService]
-    U --> V[Advance last_processed_chat_record_id\nto max processed record.id]
-    V --> SLEEP
+    BUS[system.cheatsheet.new_response\nbus event] -->|chat_id + project_id| Q[Pending queue]
+    POLL[120s fallback poll\nget_chats_needing_cheatsheet] --> Q
+    Q --> DRAIN[Drain + deduplicate\nby chat_id]
+    DRAIN --> PER[For each pending chat]
+
+    PER --> CUR[Read chat.cheatsheet_cursor_ts\nper-chat timestamp]
+    CUR --> FETCH[Fetch TAIL_WINDOW_SIZE+1\nAGENT RESPONSE records after cursor_ts]
+    FETCH --> EMPTY{Any records?}
+    EMPTY -->|No| DONE[Done]
+    EMPTY -->|Yes| OLDEST[oldest = agent_records[0]]
+
+    OLDEST --> NOCURSOR{cursor_ts is None?}
+    NOCURSOR -->|Yes — new/short chat| CURATE[Curate oldest record]
+    NOCURSOR -->|No — cursor exists| COUNT{len records &lt;\nTAIL_WINDOW_SIZE+1?}
+    COUNT -->|No — full set returned\noldest has scrolled out| CURATE
+    COUNT -->|Yes — in tail| IDLE{Chat idle\n> 10 min?}
+    IDLE -->|No — active| DEFER[Defer — log and return]
+    IDLE -->|Yes — idle| CURATE
+
+    CURATE --> UQ[Find most recent USER record\nbefore oldest.id]
+    UQ --> UQF{User query found?}
+    UQF -->|No| ADV1[Advance cursor_ts\nto oldest.timestamp]
+    UQF -->|Yes| RESP[Get agent response\ncompressed_message or message]
+    RESP --> EMPTY2{Response empty?}
+    EMPTY2 -->|Yes| ADV1
+    EMPTY2 -->|No| LLM[CheatsheetService.update_cheatsheet\nLLM curator: user_query + model_answer\n+ existing cheatsheet JSON]
+    LLM --> ADV2[Advance cursor_ts\nto oldest.timestamp]
+    ADV1 --> DONE
+    ADV2 --> DONE
 ```
 
 **Key behaviours:**
-- Processes one exchange per chat per poll cycle — oldest unprocessed exchange, not newest
-- Tail guard (`TAIL_WINDOW_SIZE=2` AGENT RESPONSE records) skips exchanges still in active context window
-- Idle bypass: if last AGENT RESPONSE > 1 hour ago, tail guard lifts — remaining tail exchanges are curated
-- Curator receives raw `message` (not `compressed_message`) so it can detect `verified` vs `inferred` confidence from tool result blocks
-- Output stored as structured JSON (`data_insights` / `key_facts`); rendered to markdown for context injection
-- Both cheatsheet and habits accumulate across re-entries: curator carries all previous entries forward and only appends or marks conflicts — nothing is replaced
+- Event-driven: wakes immediately on `system.cheatsheet.new_response` bus event; 120s fallback poll catches events missed across restarts
+- Processes oldest unprocessed exchange per chat per wake cycle — one record at a time
+- Tail guard (`TAIL_WINDOW_SIZE=2`): fetches `TAIL_WINDOW_SIZE+1` unprocessed records; if full set returned, oldest has scrolled out and is processed; if fewer, oldest is still in the active tail
+- Short-chat bypass: when `cursor_ts is None` (nothing processed yet for this chat), tail protection is skipped entirely
+- Idle bypass: if most recent unprocessed response is > 10 min old, tail guard lifts regardless of record count
+- Curator uses `compressed_message or message` — compressed strips tool JSON noise while preserving the key answer
+- Per-chat timestamp cursor (`chat.cheatsheet_cursor_ts`) — no global cursor, no cross-chat race
 
 **Re-entry behaviour (user returns after idle):**
-- Tail guard re-evaluates dynamically on each poll against the most recent AGENT RESPONSE records
-- When user returns and new exchanges arrive, tail guard re-establishes around the new session's records
+- New AGENT RESPONSE records arrive after `cursor_ts` → they enter the queue via bus event
+- Tail guard re-establishes around the new session's records
 - New exchanges are processed in order as they scroll past the tail boundary — seamless continuation
-
-**Known structural bug — global cursor race:**
-When a poll batch contains records from multiple chats (e.g. Chat A records [10, 30] and Chat B record [40]), the agent picks the oldest per chat (Chat A → 10, Chat B → 40), processes both, then advances the global cursor to `max(10, 40) = 40`. Chat A's record 30 was visible in the batch but not chosen — it is now below the cursor and permanently lost. The cursor encodes global ordering but decisions are per-chat, making the two incompatible.
 
 ---
 
@@ -105,44 +111,44 @@ When a poll batch contains records from multiple chats (e.g. Chat A records [10,
 
 ```mermaid
 flowchart TD
-    A[Poll every 5min] --> B[Read global_cursor\nfrom agent_memory GLOBAL]
-    B --> C[Fetch AGENT RESPONSE records\nid > global_cursor · limit 100]
-    C --> D{Any new records?}
-    D -->|No| SLEEP[Sleep 60s]
+    A[Poll every 5min] --> B[get_idle_chats\nSQL: max response > 1h ago\nAND max response > COALESCE habit_cursor_ts epoch]
+    B --> EMPTY{Any idle chats?}
+    EMPTY -->|No| SLEEP[Sleep poll_interval\ndefault 5min]
     SLEEP --> A
-    D -->|Yes| E[Keep LATEST agent response\nper chat_id]
-    E --> F{Latest response\n> 1 hour ago?}
-    F -->|No — still active| SKIP[Skip chat\nnot idle yet]
-    SKIP --> NEXT
-    F -->|Yes — session idle| G{latest_id > chat_cursor\nfor this chat?}
-    G -->|No — already processed| SKIP
-    G -->|Yes — new exchanges| H[Fetch USER records since chat_cursor\nlimit 200 · no msg_role filter]
-    H --> I[Fetch AGENT RESPONSE records\nsince chat_cursor · limit 200]
-    I --> J[Merge and sort by id\nbuild transcript: User/Assistant turns]
-    J --> K[Load chat.habit\nexisting habit profile or none]
-    K --> L[LLM: session transcript\n+ existing habits]
-    L --> M[Extract from &lt;habits&gt; tags\n5 dimensions: QUERY STYLE · INTERACTION STYLE\nOUTPUT PREFERENCES · DOMAIN FOCUS · EXPERTISE SIGNALS]
-    M --> N{New habits\nnon-empty?}
-    N -->|No| CURSOR
-    N -->|Yes| O[Write to chat.habit\nvia ProjectService.update_chat_habit]
-    O --> CURSOR[Advance chat_cursor\nto latest_id]
-    CURSOR --> NEXT[Advance global_cursor\nto max seen id across all chats]
-    NEXT --> SLEEP
+    EMPTY -->|Yes| ITER[For each chat_id · project_id · latest_ts]
+    ITER --> CUR[Read chat.habit_cursor_ts\nper-chat timestamp]
+    CUR --> FETCH1[Fetch USER records\nsince cursor_ts · limit 200]
+    FETCH1 --> FETCH2[Fetch AGENT RESPONSE records\nsince cursor_ts · limit 200]
+    FETCH2 --> MERGE[Merge + sort by id\nbuild transcript: User / Assistant turns]
+    MERGE --> CHECK{Any records?}
+    CHECK -->|No| FALSE[Return False]
+    CHECK -->|Yes| COMP[AGENT records: use compressed_message\nif available — strips tool JSON noise]
+    COMP --> HABIT[Load chat.habit\nexisting habit profile or none]
+    HABIT --> LLM[LLM: session transcript\n+ existing habits]
+    LLM --> EXTRACT[Extract from &lt;habits&gt; tags\nor keep existing if tags missing]
+    EXTRACT --> NONEMPTY{New habits non-empty\nand ≠ none?}
+    NONEMPTY -->|No| ADV[Advance chat.habit_cursor_ts\nto latest_ts]
+    NONEMPTY -->|Yes| WRITE[Write to chat.habit\nProjectService.update_chat_habit]
+    WRITE --> ADV
+    ADV --> NEXT[Next idle chat]
+    NEXT --> FASTSLEEP{Any chats\nprocessed?}
+    FASTSLEEP -->|Yes| SLEEP2[Sleep 5s]
+    FASTSLEEP -->|No| SLEEP
+    SLEEP2 --> A
 ```
 
 **Key behaviours:**
-- Per-session trigger: fires once per chat per idle period, not per exchange
-- Idle detection: AGENT RESPONSE timestamp > `IDLE_THRESHOLD` (1 hour) — same threshold as CheatsheetAgent's idle bypass
-- Two-cursor design: global cursor (efficiency filter — skip already-seen record IDs) + per-chat cursor (correctness — tracks what was processed for habit extraction)
+- Per-session trigger: processes a chat once after it goes idle (no new AGENT RESPONSE for `IDLE_THRESHOLD` = 1 hour)
+- Idle detection delegated to SQL: `get_idle_chats` returns chats where `max(response timestamp) < now - 1h` AND `max(response timestamp) > COALESCE(habit_cursor_ts, epoch)` — no Python-level bookkeeping
+- Single per-chat cursor (`chat.habit_cursor_ts`): set to `latest_ts` after each processing run; no global cursor
 - Transcript assembly fetches USER and AGENT records in separate queries (USER records have no `msg_role` field) then merges by ID
 - Habit profile written to `chat.habit` — per-chat storage; ConsolidationAgent later reads all `chat.habit` entries and promotes to USER-scoped `agent_memory`
-- Output format: structured text with `## DIMENSION` headers (QUERY STYLE / INTERACTION STYLE / OUTPUT PREFERENCES / DOMAIN FOCUS / EXPERTISE SIGNALS)
-- Update strategy: confirms → unchanged, strengthens → mark confirmed, contradicts → soften, new → add. Nothing is replaced.
+- Output format: structured text; update strategy is accumulative — confirms leave habits unchanged, contradictions soften, new patterns are appended
 
 **Re-entry behaviour (user returns after idle):**
-- New AGENT RESPONSE records arrive with IDs > chat_cursor → `_has_new_records` returns True
-- But `_is_idle` returns False (latest response is recent) → chat is skipped
-- Second idle: HabitAgent processes only new exchanges since the chat cursor, loads `chat.habit` as existing context, incrementally refines the profile
+- First idle: habit extracted, `habit_cursor_ts` advanced to `latest_ts`
+- User returns → new exchanges arrive after `habit_cursor_ts` → chat re-qualifies at next idle
+- Second idle: HabitAgent fetches only records since `habit_cursor_ts`, loads `chat.habit` as existing context, incrementally refines the profile
 - The first session's habits survive unless directly contradicted by the new session
 
 ---
@@ -157,12 +163,6 @@ flowchart TD
 ### What doesn't
 The architecture has no episodic retrieval path and no external persistence path. Everything resets between chats. Both the RAG index and `agent_memory` exist but are either incomplete or never written to by sub-agents.
 
-**Cheatsheet curator has two additional structural bugs that undermine extraction quality:**
-- **Wrong message priority** — `cheatsheet_agent.py:182` reads `message or compressed_message`, so the
-  curator always sees the raw noisy original. Should be `compressed_message or message` (same as `ida.py`).
-- **No scope boundary with tail window** — curator runs on every exchange including turns still in
-  the tail window, where the model already has the full raw text. The cheatsheet only adds value for
-  turns that have scrolled out. Curating in-tail turns creates redundant entries and wastes LLM calls.
 
 ---
 
