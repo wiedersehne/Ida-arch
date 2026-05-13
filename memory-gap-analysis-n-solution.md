@@ -69,7 +69,7 @@ flowchart TD
     CUR --> FETCH[Fetch TAIL_WINDOW_SIZE+1\nAGENT RESPONSE records after cursor_ts]
     FETCH --> EMPTY{Any records?}
     EMPTY -->|No| DONE[Done]
-    EMPTY -->|Yes| OLDEST[oldest = agent_records[0]]
+    EMPTY -->|Yes| OLDEST[oldest = first unprocessed record]
 
     OLDEST --> NOCURSOR{cursor_ts is None?}
     NOCURSOR -->|Yes — new/short chat| CURATE[Curate oldest record]
