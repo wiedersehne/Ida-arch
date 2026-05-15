@@ -178,11 +178,24 @@ to USER-scoped `agent_memory` — is ConsolidationAgent's responsibility (EP-4).
 
 ---
 
+### Task 2.7 — CC: re-index with compressed content after compression
+
+**File:** `backend/app/agents/workers/context_compressor.py`
+
+**Problem (from gap analysis):** CC indexes Job 1 first (original message → RAG), then runs Job 2 (compress if > 2000 chars). After compression, the RAG entry still holds the noisy original — tool dumps, verbose markdown, boilerplate. Chat history search returns degraded content.
+
+**Fix:** After writing `compressed_message` in Job 2, replace the RAG embedding for that record. Delete the old embedding by `record_id` and re-embed with `compressed_message`. Records that are not compressed (< 2000 chars) remain as-is — original is the final content.
+
+**Expected result:** RAG `source_type=CHAT` entries always hold the cleanest available version of each record. `tool_search_chat_history` returns compressed, noise-free excerpts.
+
+---
+
 ### Validation (end of May 22)
 
 - Restart service; embed a message; restart again — verify no duplicate RAG entries.
 - In a session with prior NPT analysis: ask about the same well — verify agent retrieves prior turn without re-prompting.
 - Trigger ConsolidationAgent manually on a known chat — verify `agent_memory` rows appear with `scope=PROJECT`, `memory_type=data_insight`.
+- Compress a long record; query it via `tool_search_chat_history` — verify result contains compressed text, not raw tool dump.
 
 ---
 
@@ -231,28 +244,9 @@ to USER-scoped `agent_memory` — is ConsolidationAgent's responsibility (EP-4).
 9. Write result to `agent_memory` USER scope, `memory_type=USER_PROFILE`, `content_text=merged_profile`.
 10. Advance `habit_consolidation_cursor` in GLOBAL `agent_memory`.
 
-*Overflow / mid-session trigger (if time permits):*
-
-**Two trigger conditions — same agent, different behavior:**
-
-| Trigger | Mode | Promotion policy |
-|---|---|---|
-| 30-min inactivity / session close | Clean end-of-session | `verified` promotes at 0.85 · `inferred` cross-checked then promoted or flagged |
-| Context window ~80% full | Forced mid-session | `verified` only at 0.85 · `inferred` written at 0.4 and flagged — session was cut short |
-
-**Context budget monitor** (lightweight check inside IDA each turn):
-Estimate token usage: SOUL.md + AGENT.md + active SKILL.md + PROJECT snapshot
-+ cheatsheet rendered + tail window. When approaching 80% of the model's context limit,
-fire the overflow trigger.
-
-**On overflow — IDA spawns itself:**
-1. ConsolidationAgent runs in mid-session mode, promotes `verified` cheatsheet entries.
-2. IDA spawns a new instance of itself to continue the conversation.
-3. Spawned instance is seeded with: PROJECT memory snapshot (now including newly promoted
-   entries) + current cheatsheet + last 12 turns as the opening tail.
-4. User is notified that the session has continued seamlessly.
-
 **Conservative default for initial soak:** only auto-promote `verified` entries. All `inferred` promotions logged for manual review until quality is validated.
+
+*Overflow / mid-session trigger:* deferred to Task 5.1 (Jun 9 week) — requires ConsolidationAgent to be stable before adding the second trigger mode.
 
 ---
 
@@ -264,7 +258,23 @@ fire the overflow trigger.
 
 ---
 
-### Task 4.3 — Spawned IDA instances load session context
+### Task 4.3 — Sub-agents: use compressed_message + read cheatsheet
+
+**Files:** `backend/app/agents/skills/data_insight_agent/AGENT.md`, `sme_agent/AGENT.md`, `viz_agent/AGENT.md`
+
+**Two problems (from gap analysis):**
+
+1. **Sub-agents ignore `compressed_message`** — all sub-agents load chat history using raw `message`. Only the orchestrator (`ida_agent`) reads `compressed_message or message`. After compression runs, sub-agents still see the original noisy content.
+
+   **Fix:** Audit each sub-agent's history loading path. Wherever a sub-agent loads prior turns, ensure it prefers `compressed_message` over `message`.
+
+2. **Sub-agents don't read the cheatsheet** — even within a session, only the orchestrator calls `tool_read_cheatsheet`. Sub-agents (`data_insight_agent`, `sme_agent`) do the actual analysis without seeing accumulated findings. The gap analysis identifies this as a missed quality opportunity: a sub-agent analyzing NPT should know what was already established about this well.
+
+   **Fix:** Add a `tool_read_cheatsheet(chat_id=...)` step to each sub-agent's AGENT.md planning section, read before first tool call.
+
+---
+
+### Task 4.4 — Spawned IDA instances load session context
 
 **File:** `backend/app/agents/skills/ida_agent/AGENT.md`
 
@@ -286,11 +296,34 @@ the parent chat record and picked up by the CheatsheetAgent on its next poll.
 
 ---
 
-## Jun 9–27: Soak + Tuning
+## Jun 9–27: EP-5 + Soak + Tuning
 
-**Goal:** Validate quality across diverse sessions. Tune promotion thresholds. By this point coding is mostly done — this period is about quality validation and prompt iteration.
+**Goal:** Implement context overflow handling (EP-5). Validate quality across diverse sessions. Tune promotion thresholds.
 
-### What happens here
+### Task 5.1 — EP-5: Context overflow detection + mid-session ConsolidationAgent trigger
+
+**Files:** `backend/app/agents/skills/ida_agent/AGENT.md`, `backend/app/agents/workers/consolidation_agent.py`
+
+**Problem (from gap analysis):** IDA has no mechanism to detect or handle a full context window. A long session hits the token limit and fails. The gap analysis (EP-5) specifies a context budget monitor + a second ConsolidationAgent trigger mode.
+
+**Implementation:**
+
+*Context budget monitor (lightweight, each turn):*
+Estimate token usage: SOUL.md + AGENT.md + active SKILL.md + PROJECT snapshot + cheatsheet rendered + tail window. Add to orchestrator AGENT.md planning instructions. When approaching 80% of context limit, fire overflow trigger.
+
+*Mid-session ConsolidationAgent trigger:*
+ConsolidationAgent already has a `30-min inactivity` trigger (Task 2.6/4.1). Add a second trigger mode: `overflow`. In overflow mode, promotion policy is conservative — only `verified` entries promote at 0.85; `inferred` written at 0.4 and flagged.
+
+*Session continuation:*
+1. ConsolidationAgent promotes verified cheatsheet findings to PROJECT memory.
+2. IDA opens a new chat, seeds it with: PROJECT memory snapshot + current cheatsheet + last 12 turns.
+3. User is notified session has continued seamlessly.
+
+**Expected result:** Sessions longer than the context window continue without hard failure. User sees no interruption.
+
+---
+
+### What happens here (soak)
 
 - Run minimum 6 real well sessions across ≥ 2 wells.
 - After each session: inspect `agent_memory` — flag false positives (wrong facts at `confidence ≥ 0.8`) and false negatives (important findings discarded).
