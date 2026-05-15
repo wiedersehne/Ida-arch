@@ -47,7 +47,7 @@ Session-end habit extraction. These three are prerequisites for everything downs
 
 ---
 
-### Task 1 — Fix cheatsheet message priority
+### Task 1.1 — Fix cheatsheet message priority
 
 **File:** `backend/app/agents/workers/cheatsheet_agent.py`
 
@@ -60,7 +60,7 @@ which compression destroys. History loading (user query lookup) uses
 
 ---
 
-### Task 2 — Scope curator to scrolled-out turns only
+### Task 1.2 — Scope curator to scrolled-out turns only
 
 **File:** `backend/app/agents/workers/cheatsheet_agent.py`
 
@@ -74,7 +74,7 @@ AGENT RESPONSE records. Tail window = 2 complete exchanges. Skip records with
 
 ---
 
-### Task 3 — Structured JSON storage
+### Task 1.3 — Structured JSON storage
 
 **Files:** `backend/app/services/cheatsheet/cheatsheet_schema.py`,
 `backend/app/services/cheatsheet/cheatsheet_service.py`
@@ -104,7 +104,7 @@ not derivable per-exchange by the curator.
 
 ---
 
-### Task 4 — Update curator prompt
+### Task 1.4 — Update curator prompt
 
 **File:** `backend/app/services/cheatsheet/cheatsheet_curator_prompt.py`
 
@@ -121,7 +121,7 @@ not derivable per-exchange by the curator.
 
 ---
 
-### Task 5 — Parse and store curator output
+### Task 1.5 — Parse and store curator output
 
 **Files:** `backend/app/services/cheatsheet/cheatsheet_service.py`,
 `backend/app/agents/workers/cheatsheet_agent.py`
@@ -132,7 +132,7 @@ via `CheatsheetService`. Malformed output is logged and skipped — poll loop mu
 
 ---
 
-### Task 6 — agent_memory schema migration (EX-5)
+### Task 1.6 — agent_memory schema migration (EX-5)
 
 **Files:** `backend/app/db/agents_memory.py`, migration file
 
@@ -160,7 +160,7 @@ fixed (see Task 9 — May 18 week). All bookkeeping writes are unaffected.
 
 ---
 
-### Task 7 — HabitAgent (EX-2 phase 1)
+### Task 1.7 — HabitAgent (EX-2 phase 1)
 
 **Files:** `backend/app/agents/workers/habit_agent.py`,
 `backend/app/services/habit/habit_agent_prompt.py`,
@@ -206,7 +206,7 @@ cheatsheet promotion path working end-to-end.
 
 ---
 
-### Task 8 — CC: re-index with compressed content after compression
+### Task 2.1 — CC: re-index with compressed content after compression
 
 **File:** `backend/app/agents/workers/context_compressor.py`
 
@@ -227,7 +227,7 @@ are not re-indexed — original is the final content.
 
 ---
 
-### Task 9 — Fix SQLModel enum bug for `memory_type` writes
+### Task 2.2 — Fix SQLModel enum bug for `memory_type` writes
 
 **File:** `backend/app/db/agents_memory.py`
 
@@ -240,7 +240,7 @@ gets a Postgres constraint error. This blocks ConsolidationAgent.
 
 ---
 
-### Task 10 — Wire `tool_search_chat_history` into IDA's AGENT.md
+### Task 2.3 — Wire `tool_search_chat_history` into IDA's AGENT.md
 
 **File:** `backend/app/agents/skills/ida_agent/AGENT.md`
 
@@ -253,7 +253,7 @@ established in a prior turn, call `tool_search_chat_history` first.
 
 ---
 
-### Task 11 — ConsolidationAgent: skeleton + cheatsheet promotion path
+### Task 2.4 — ConsolidationAgent: skeleton + cheatsheet promotion path
 
 **File:** New `backend/app/agents/workers/consolidation_agent.py`
 
@@ -276,7 +276,7 @@ logged for manual review until soak confirms quality.
 
 **Register in:** `backend/app/agents/factory/registry.py`
 
-Habit promotion path and overflow trigger deferred to Tasks 12 and 16.
+Habit promotion path deferred to Task 3.1. Overflow trigger deferred to Task 4.1.
 
 ---
 
@@ -297,7 +297,7 @@ IDA's session start. Fix sub-agent history loading quality.
 
 ---
 
-### Task 12 — ConsolidationAgent: habit promotion path (EX-2 phase 2)
+### Task 3.1 — ConsolidationAgent: habit promotion path (EX-2 phase 2)
 
 **File:** `backend/app/agents/workers/consolidation_agent.py`
 
@@ -311,7 +311,7 @@ IDA's session start. Fix sub-agent history loading quality.
 
 ---
 
-### Task 13 — Session-start memory injection (EX-1)
+### Task 3.2 — Session-start memory injection (EX-1)
 
 **File:** `backend/app/agents/skills/ida_agent/AGENT.md`
 
@@ -324,7 +324,7 @@ Read `project_index` if present for project-wide context.
 
 ---
 
-### Task 14 — Sub-agents: use `compressed_message` + read cheatsheet
+### Task 3.3 — Sub-agents: use `compressed_message` + read cheatsheet
 
 **Files:** `backend/app/agents/skills/data_insight_agent/AGENT.md`,
 `sme_agent/AGENT.md`, `viz_agent/AGENT.md`
@@ -346,7 +346,7 @@ Two gaps from the gap analysis:
 
 ---
 
-### Task 15 — Spawned IDA instances load session context
+### Task 3.4 — Spawned IDA instances load session context
 
 **File:** `backend/app/agents/skills/ida_agent/AGENT.md`
 
@@ -378,7 +378,7 @@ Tune promotion thresholds and curator prompt.
 
 ---
 
-### Task 16 — EP-5: Context overflow detection + mid-session ConsolidationAgent trigger
+### Task 4.1 — EP-5: Context overflow detection + mid-session ConsolidationAgent trigger
 
 **Files:** `backend/app/agents/skills/ida_agent/AGENT.md`,
 `backend/app/agents/workers/consolidation_agent.py`
@@ -415,12 +415,12 @@ ConsolidationAgent gains a second trigger mode: `overflow`. Policy differs from 
   classification; adjust confidence thresholds
 - Tune curator prompt: fix numeric values still being paraphrased; correct misassigned
   confidence tiers; add domain-specific examples
-- If cheatsheet overflow occurs: implement Task 1.6 — per-bucket caps (50 `data_insights`,
+- If cheatsheet overflow occurs: implement Task 4.2 — per-bucket caps (50 `data_insights`,
   20 `key_facts`) with deterministic eviction: `conflicted` → `inferred` → `verified`
 
 ---
 
-### Task 1.6 — Cheatsheet size cap *(implement only if soak reveals overflow)*
+### Task 4.2 — Cheatsheet size cap *(implement only if soak reveals overflow)*
 
 **Files:** `backend/app/services/cheatsheet/cheatsheet_service.py`,
 `backend/app/services/cheatsheet/cheatsheet_curator_prompt.py`
