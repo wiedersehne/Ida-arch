@@ -262,32 +262,35 @@ Both agents fire at 60-minute idle. In practice this means both run simultaneous
 
 ## Memory Injection into the Agent Workflow
 
-IDA's agent runs as a five-node reasoning loop: **Understand → Plan → Execute → Evaluate → Answer**. Each node receives a subset of available memory — injected statically into the prompt, or loaded dynamically via tool call during execution. The injection pattern determines what Ida knows when, and therefore how well she reasons at each step.
+Ida is a single agent running a five-node reasoning loop: **Understand → Plan → Execute → Evaluate → Answer**. There are no sub-agents. Each node receives a subset of available memory — injected statically into the prompt, or loaded dynamically via tool call. The injection pattern determines what Ida knows at each step.
 
 ### Injection map
 
 | Memory source | Type | U | P | Ex | Ev | A |
 |---|---|:---:|:---:|:---:|:---:|:---:|
 | Soul.md + Agent.md | Identity, task scope | ✓ | ✓ | ✓ | ✓ | — |
-| Chat History | Session episodic | ✓ | ✓ | ◌ | — | — |
-| Cheatsheet | Session episodic | ✓ | ✓ | ◌ | — | — |
-| User Profile | USER agent_memory | ✓ | ✓ | — | — | — |
-| Project Memory | PROJECT agent_memory | — | — | ✓ | — | — |
+| Recent Chat History | Session episodic | ✓ | — | ◌ | — | — |
+| Cheatsheet | Session episodic | ✓ | — | ◌ | — | — |
+| User Profile | USER agent_memory | ✓ | — | — | — | — |
+| Project Memory | PROJECT agent_memory | ✓ | ✓ | — | — | — |
 | Skill.md | Per-task instructions | — | — | ✓ | — | — |
 
-**✓** = always injected into the system prompt · **◌** = on demand via tool (`tool_read_cheatsheet`, `tool_read_chat_history`) · **—** = not loaded at this node
+**✓** = always injected · **◌** = on demand via tool (`tool_read_cheatsheet`, `tool_read_chat_history`) · **—** = not loaded
 
 ### Workflow diagram
 
 ```mermaid
 flowchart TD
     soul(["Soul.md + Agent.md\nIdentity · task scope · reasoning principles"])
-    ep(["Chat History  ·  Cheatsheet\nSession episodic memory"])
+    ep(["Recent Chat History  ·  Cheatsheet\nSession episodic memory"])
     up(["User Profile\nUSER-scoped agent_memory"])
     pm(["Project Memory\nPROJECT-scoped agent_memory"])
     sk(["Skill.md\nPer-task instructions"])
 
-    U["🔍 Understand"] --> P["📐 Plan"] --> Ex["⚙️ Execute"] --> Ev["✅ Evaluate"] --> A["💬 Answer"]
+    U["🔍 Understand"] -->|intent + context summary| P["📐 Plan"]
+    P -->|execution plan| Ex["⚙️ Execute"]
+    Ex -->|results| Ev["✅ Evaluate"]
+    Ev --> A["💬 Answer"]
 
     soul -->|inject| U
     soul -->|inject| P
@@ -295,13 +298,13 @@ flowchart TD
     soul -->|inject| Ev
 
     ep -->|inject| U
-    ep -->|inject| P
-    ep -.->|flexible| Ex
+    ep -.->|tool| Ex
 
     up -->|inject| U
-    up -->|inject| P
 
-    pm -.->|tool_read_memory| Ex
+    pm -->|inject| U
+    pm -->|inject| P
+
     sk -.->|tool_load_skill| Ex
 
     style soul fill:#dde,stroke:#99a
@@ -311,57 +314,66 @@ flowchart TD
     style sk fill:#ffd,stroke:#aa9
 ```
 
-### Why this split makes sense
+### Pass-through design: U synthesizes, P builds on it
 
-**Soul.md + Agent.md in all reasoning nodes.** Every step needs to stay grounded in who Ida is, what she's allowed to claim, and what the agent is responsible for. These files are small and stable — the cost of repeating them is low, the cost of omitting them is reasoning drift.
+The nodes are not independent — each receives the previous node's output as part of its input. This is the critical constraint that keeps the overall context load manageable:
 
-**Chat History + Cheatsheet in Understand and Plan.** To interpret the current turn, Ida needs conversation context (chat history). To avoid re-investigating what is already known, she needs the cheatsheet. Both are session-scoped and modest in size relative to the context window. In Execute, individual tools can fetch specific records via `tool_get_record_data` when needed — injecting the full history into every tool call would be redundant and expensive.
+- **U** receives the full picture and produces a structured output: interpreted intent, relevant entities, what is already known, what still needs investigation.
+- **P** receives U's output (already synthesized) plus Project Memory and Soul/Agent.md. It does **not** re-read raw chat history or the cheatsheet — U has already extracted what matters from them.
+- **Ex** receives P's execution plan plus Skill.md. It can pull CH or CS on demand via tool if a specific step requires them.
+- **Ev** receives Ex's results plus Soul/Agent.md to evaluate correctness and completeness.
 
-**User Profile in Understand and Plan.** Knowing how the user prefers to receive answers shapes how Ida interprets an ambiguous question (U) and how she plans the response format and detail level (P). By Execute, the tools run mechanically and user-style preferences are irrelevant.
+### Context load in Understand
 
-**Project Memory via tool in Execute.** Project memory can be large and is query-specific — which wells are relevant depends on what the execution plan has resolved. Loading it via `tool_read_memory` during Execute allows selective retrieval instead of dumping everything into every prompt. It also keeps memory out of the planner until it's actually needed.
+U carries the heaviest load. Rough token estimates for an active chat on a mature project:
 
-**Skill.md on demand in Execute.** The sub-agent doesn't know which skill applies until it has received the orchestrator's routing decision. Loading it on demand via `tool_load_skill` is the current design and works correctly.
+| Source | Typical size |
+|---|---|
+| Soul.md + Agent.md | ~2–3k tokens |
+| Recent chat history (last 12 exchanges) | ~4–6k tokens |
+| Cheatsheet | ~1–3k tokens |
+| User profile | ~0.5–1k tokens |
+| Project memory | ~2–5k tokens |
+| **Total** | **~10–18k tokens** |
 
-### Tools for flexible CH and CS access in Execute
+This is well within the 200k context limit and not a practical concern today. Two redundancy points worth watching as projects grow:
 
-Marking Chat History and Cheatsheet as "optional" in Execute is only meaningful if there is a mechanism for a skill to request them mid-execution. Without tools, "flexible" has no implementation path.
+**CH and Cheatsheet overlap.** The cheatsheet is a curated distillation of the full chat history. Injecting both means older exchanges are represented twice — once in raw form and once compressed. The mitigation is already implied in the design: inject only **recent** exchanges (last N), not the full transcript. The cheatsheet covers everything prior. These two sources are complementary, not duplicates, as long as "recent" is bounded.
 
-Two tools are needed:
+**Project memory unbounded growth.** A long-running project with many wells could accumulate substantial memory. If this becomes a constraint, the mitigation is to retrieve only the entries relevant to the current query (based on the entities in the current turn) rather than loading all project memory. This requires a lightweight retrieval step in U, which is a natural extension of the current design.
 
-**`tool_read_cheatsheet`** — reads `chat.cheatsheet` for the current chat, optionally filtered by confidence level or well name. The primary use case is a skill checking whether a fact is already verified before running an expensive retrieval tool. Example: before querying the DDR for NPT on NNM-101, the skill calls `tool_read_cheatsheet(confidence="verified", well="NNM-101")` and skips the retrieval if the data is already there.
+### Why each node gets what it gets
 
-**`tool_read_chat_history`** — reads N raw message exchanges from `chat_record`, with optional `oldest_first` and `before_record_id` parameters. Needed when a skill requires context beyond the exchanges injected in U/P — for example, a report skill referencing something from 20 exchanges back, or a reconciliation skill comparing the current answer against a much earlier one.
+**U gets everything.** Understand is the synthesis step — its job is to read the full picture and produce a compact, grounded intent statement. Giving it less context risks misinterpretation.
 
-Neither existing tool covers this:
-- `tool_read_playbook` reads session findings written by agents, but is free-text and manually maintained — not the structured, confidence-tagged cheatsheet
-- `tool_read_memory` reads from `agent_memory` (PROJECT/USER scope, cross-session) — not the per-chat cheatsheet
-- `tool_list_chat_data_records` / `tool_get_record_data` access staged analysis results, not raw message text
+**P gets Project Memory but not raw CH/CS.** The planner needs to know what has been established across sessions (project memory) to avoid scheduling redundant tool calls. It does not need to re-read the raw transcript — U's output already contains the relevant context summary.
 
-Both tools are thin wrappers over existing DB queries (`get_chat_cheatsheet`, `get_chat_records`) and belong in `mem_storage_toolbox.py`. The skill's SKILL.md `Approach` section specifies when each is called — most skills will not call them at all.
+**Soul.md + Agent.md in all reasoning nodes.** Small, stable, and essential for grounding every reasoning step. Omitting them causes drift.
 
-### Design gap: planner is blind to cross-session findings
+**Ex gets Skill.md on demand.** Ida doesn't know which skill applies until the plan is formed. `tool_load_skill` is called at the start of Execute once the task type is clear.
 
-Project Memory is only loaded in Execute. This means the Plan phase has no visibility into what was confirmed in previous sessions — the planner could schedule tool calls to retrieve NPT data for NNM-101 even if that was fully resolved two sessions ago.
+**CH and CS optionally in Ex.** Some skills need to verify a fact against the cheatsheet before running a retrieval tool, or need transcript context beyond what was injected in U. These are loaded via `tool_read_cheatsheet` and `tool_read_chat_history` — see the tools section below.
 
-**Short-term mitigation:** ConsolidationAgent writes compact `content_text` fields alongside each memory object. A lightweight memory summary (top-N content_text strings, truncated) injected into Plan would let the planner skip redundant investigation without loading the full memory payload.
+### Tools for CH and CS access in Execute
 
-**Longer-term:** A dedicated memory-recall step before Plan — reading relevant project memories based on the understood intent — would close this gap cleanly. This is the same pattern used in retrieval-augmented planning.
+**`tool_read_cheatsheet`** — reads `chat.cheatsheet`, optionally filtered by confidence level or well name. Primary use: check whether a fact is already verified before running an expensive retrieval tool. Example: `tool_read_cheatsheet(confidence="verified", well="NNM-101")` returns known facts about that well; if complete, skip the DDR query.
+
+**`tool_read_chat_history`** — reads N raw message exchanges from `chat_record` with optional offset. Needed when a skill requires context beyond what U injected — for example, a report skill referencing an exchange from 20 turns back.
+
+Neither existing tool covers this: `tool_read_playbook` is free-text and manually maintained; `tool_read_memory` reads cross-session `agent_memory`, not the per-chat cheatsheet; `tool_get_record_data` accesses staged analysis results, not raw message text. Both new tools are thin wrappers over existing DB queries and belong in `mem_storage_toolbox.py`.
 
 ### Current vs target state
-
-The diagram above describes the **target design**. As of this writing:
 
 | Memory source | Write path | Read path |
 |---|---|---|
 | Soul.md + Agent.md | Manual (checked in) | Injected in current prompts ✓ |
 | Chat History | Framework (`load_message_history`) | Loaded in U ✓ |
-| Cheatsheet | CheatsheetAgent ✓ | **Not yet injected in U/P** |
-| User Profile | HabitAgent ✓ | **Not yet read by any sub-agent** |
-| Project Memory | ConsolidationAgent ✓ | **Not yet read by any sub-agent** |
+| Cheatsheet | CheatsheetAgent ✓ | **Not yet injected in U** |
+| User Profile | HabitAgent ✓ | **Not yet read** |
+| Project Memory | ConsolidationAgent ✓ | **Not yet injected in U/P** |
 | Skill.md | Manual (checked in) | Loaded on demand in Ex ✓ |
 
-The infrastructure to write all memory types is complete. The activation — injecting cheatsheet + user profile into U/P, and wiring `tool_read_memory` calls into sub-agent AGENT.md files — is the remaining work.
+The write infrastructure is complete. The remaining work is activation: inject cheatsheet, user profile, and project memory into the U/P prompts in `AGENT.md`.
 
 ---
 
