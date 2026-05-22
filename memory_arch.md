@@ -269,12 +269,12 @@ Ida is a single agent running a five-node reasoning loop: **Understand → Plan 
 | Memory source | U | P | Ex | Ev | A |
 |---|:---:|:---:|:---:|:---:|:---:|
 | Soul + Agent.md | ✓ | ✓ | ✓ | ✓ | — |
-| CH + CS | ✓ | ✓ | ◌ | — | — |
+| CH + CS | ✓ | — | ◌ | — | — |
 | User Profile | ✓ | — | — | — | — |
 | Project Memory | ↑ | — | ◌ | — | — |
 | Skill.md | — | — | ✓ | — | — |
 
-**✓** inject (static, always in prompt) · **↑** retrieve top-K by entity at node start · **◌** on demand via tool · **—** not loaded
+**✓** inject (static, always in prompt) · **↑** retrieve top-K by entity at node start · **◌** on demand via tool · **—** not loaded · P also receives U's state output (intent, entities, known facts) — not listed as a memory source since it is produced within the workflow
 
 ### Workflow diagram
 
@@ -294,7 +294,6 @@ flowchart TD
     soul --> Ev
 
     ep --> U
-    ep --> P
     ep -.->|tool| Ex
 
     up --> U
@@ -316,13 +315,14 @@ flowchart TD
 | Source | Typical size | U | P |
 |---|---|:---:|:---:|
 | Soul + Agent.md | ~2–3k | ✓ | ✓ |
-| CH (last 12 exchanges) | ~4–6k | ✓ | ✓ |
-| CS | ~1–3k | ✓ | ✓ |
+| CH (last 12 exchanges) | ~4–6k | ✓ | — |
+| CS | ~1–3k | ✓ | — |
 | User Profile | ~0.5–1k | ✓ | — |
-| Project Memory | top-K only, ~1–2k | ↑ | via state |
-| **Total** | **~9–15k** | | |
+| Project Memory (top-K) | ~1–2k | ↑ | — |
+| U's state output | ~1–2k | — | ✓ |
+| **Total** | | **~9–15k** | **~3–5k** |
 
-P receives U's state output rather than a fresh PM injection — no additional tokens beyond what U already synthesized. This keeps P lean and avoids re-reading raw sources.
+U carries the full context load; P is lean. P receives only Soul/Agent.md and U's structured state — intent, identified entities, what is already known from CS and retrieved PM. It reasons over a compact synthesis, not raw sources.
 
 **CH and CS overlap.** The cheatsheet is a curated distillation of older exchanges. They are complementary as long as CH is bounded to recent exchanges (last N) — CS covers history prior to the window. No redundancy if this bound is enforced.
 
@@ -330,7 +330,7 @@ P receives U's state output rather than a fresh PM injection — no additional t
 
 **U gets the full picture — including top-K project memory retrieval.** U's job is to synthesize: interpret the query, identify the relevant entities and wells, recall what is already known about them, and produce a structured state for the rest of the workflow. PM is retrieved by entity match at the start of U, not dumped wholesale. The retrieved entries travel forward in U's state output.
 
-**P consumes U's state — no raw re-injection.** P receives Soul/Agent.md plus U's output (intent, entities, known facts including retrieved PM). It does not re-read CH, CS, or PM from source. Re-injecting the same raw sources at P is the context-stuffing anti-pattern: P reasons better over a compact, synthesized state than over 15k tokens of repeated context.
+**P consumes U's state — no raw sources.** P receives Soul/Agent.md plus U's structured output: intent, identified entities, what is already known (from CS and retrieved PM), and what still needs investigation. It never sees raw CH, CS, or PM. This halves P's context load (~3–5k vs ~9–15k) and eliminates the context-stuffing anti-pattern where the same content appears twice in the prompt.
 
 **Soul + Agent.md in all reasoning nodes.** Small, stable, and essential for grounding every step. Omitting them causes behavioral drift.
 
@@ -389,13 +389,9 @@ The write infrastructure is complete. The remaining work is activation: inject c
 
 ~~The current design injects all project memory into U and P unconditionally.~~ **Resolved:** PM is retrieved by entity match at the start of U (top-K, not full-dump). The retrieved entries travel forward in U's state output to P; P has no direct PM injection. For IDA's current scale, entity-based filtering (by well name extracted from the query) is sufficient. Semantic embedding search over `content_text` is the natural next step when entity matching is insufficient.
 
-**2. Re-injecting the same raw sources at both U and P.**
+**2. Re-injecting raw sources at both U and P — fixed.**
 
-U and P both receive CH, CS, and project memory. This is the "context stuffing" anti-pattern. In LangGraph, LangChain Expression Language, and ReAct-style frameworks, nodes pass structured state forward — U produces an intent object (interpreted query, relevant entities, known facts) and P consumes that object. P does not re-read the raw sources; it reasons over U's output.
-
-Re-injection has two costs. First, token cost: the same 10–17k tokens are paid twice per user turn. Second, reasoning cost: an LLM presented with the same content in two places (the raw CH and U's synthesis of it) can attend to either, which reduces the reliability of the synthesis step. If U's output is well-structured, P should not need raw CH or CS — it has everything U extracted.
-
-The fix: define a structured `ReasoningState` that U populates (intent, entities, what is already known, what still needs investigation) and P consumes. P only needs Soul/Agent.md, project memory (for planning around cross-session knowledge), and the ReasoningState. Raw CH and CS drop out of P.
+~~U and P both receive CH, CS, and project memory.~~ **Resolved:** P now receives only Soul/Agent.md and U's structured state output. Raw CH, CS, and PM are not re-injected at P. U populates a `ReasoningState` (intent, entities, what is already known, what still needs investigation); P reasons over that. Token cost at P drops from ~10–17k to ~3–5k, and the same content no longer appears twice in the prompt.
 
 **3. Cheatsheet is injected without confidence filtering.**
 
@@ -423,7 +419,7 @@ Ev should also receive the original user query and an explicit quality rubric (e
 | Background agents, cursor-based | ✓ Correct |
 | Tool access for CH/CS/PM in Ex | ✓ Correct |
 | PM top-K retrieval in U, state to P | ✓ Fixed — entity-conditioned, not full-dump |
-| Re-injecting CH + CS in P | ✗ Context stuffing — P should consume U's state output |
+| CH + CS in U only, P consumes state | ✓ Fixed — P prompt cut from ~15k to ~3–5k |
 | Cheatsheet injected without confidence filter | ✗ Risk of conflicted entries misleading reasoning |
 | Ev grounded only in Soul/Agent.md | ✗ Insufficient — needs task + quality criteria |
 
