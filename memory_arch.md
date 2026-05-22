@@ -1,647 +1,480 @@
 # IDA Memory Architecture
 
-## Overview
+## Four-Layer Model
 
-IDA uses a four-layer memory model. Each layer has a defined scope, lifetime, and purpose. They are not interchangeable.
+Ida's memory system is organised across four layers. Each layer has a defined scope, lifetime, and mechanism. They are not interchangeable.
 
-| Layer | Scope | Mechanism | Lifetime | Written by |
+| Layer | Scope | Lifetime | Mechanism | Written by |
 |---|---|---|---|---|
-| ContextApi | One tool chain | `allowed_read/write_from_context_items` | Single request | Tool functions |
-| Raw chat history | One session | `load_message_history()` | In-memory, per call | Framework |
-| Cheatsheet | One conversation | `chat.cheatsheet` (JSON) | Persistent, per chat | CheatsheetAgent |
-| Agent memory | Cross-session | `agent_memory` table | Persistent, scoped | Background agents |
-
-The background agents — CheatsheetAgent, ConsolidationAgent, HabitAgent — are the bridge between ephemeral conversation and long-term memory. They run continuously alongside the main application and never block a user request.
+| **Parametric** | Universal | Permanent (immutable) | Model weights | Anthropic training |
+| **In-Context** | One request | Duration of LLM call | Prompt assembly (MemoryService) | Framework |
+| **Episodic** | Searchable history | Persistent, per-chat / per-project | RAG index + raw records | ContextCompressor |
+| **External** | Cross-session | Persistent, scoped | DB tables (`agent_memory`, `chat.*`) | Background agents |
 
 ---
 
-## Session Boundary Model
-
-Three idle thresholds define the memory lifecycle for a session:
-
-```
-Active session
-  └─ exchanges scroll out of TAIL_WINDOW (12) → curated immediately
-  └─ every 3h of cursor gap → ConsolidationAgent fires mid-session (see below)
-
-t=0       user stops
-t=40 min  IDLE_BYPASS_THRESHOLD → CheatsheetAgent flushes tail records
-t=60 min  ConsolidationAgent → promotes verified cheatsheet entries to PROJECT memory
-t=60 min  HabitAgent → extracts user habits → USER memory
-```
-
-The 20-minute gap between cheatsheet flush (40 min) and consolidation (60 min) is intentional: consolidation reads the cheatsheet, so the cheatsheet must be fully settled first.
-
-### Long active sessions
-
-ConsolidationAgent normally requires a 60-minute idle gap to fire. For sessions that run continuously without a long break, this would leave all findings in the cheatsheet with no promotion to PROJECT memory until the session ends.
-
-To handle this, ConsolidationAgent also fires when the gap between `cheatsheet_cursor_ts` and `consolidation_cursor_ts` exceeds **3 hours**, regardless of session activity:
-
-```
-FIRE when:  cheatsheet_cursor > consolidation_cursor
-            AND (idle > 60 min  OR  cursor_gap > 3 hours)
-```
-
-A full 8-hour working session therefore triggers mid-session consolidation at least twice. Because ConsolidationAgent advances `consolidation_cursor_ts` after each run, subsequent runs only process new entries — no duplication. Only `verified` entries are promoted, which are tool-result-backed and stable enough to consolidate mid-session.
-
----
-
-## CheatsheetAgent
-
-**Purpose:** Maintain a structured, per-chat memory of confirmed findings, data quality issues, and lessons learned. Updated incrementally after each exchange.
-
-**Storage:** `chat.cheatsheet` — a JSON blob with three typed buckets:
-
-```json
-{
-  "data_insights":   [{"content": "...", "confidence": "verified|inferred|conflicted", "well": "NNM-101"}],
-  "key_facts":       [{"content": "...", "confidence": "verified|inferred|conflicted"}],
-  "lessons_learned": [{"content": "...", "confidence": "verified|inferred", "well": "NNM-101"}]
-}
-```
-
-**Confidence rules:**
-- `verified` — value appears verbatim in a tool result block
-- `inferred` — derived from agent narrative, not a tool result
-- `conflicted` — same well + metric has two different values; both entries preserved
-
-### Workflow
+## Big Picture
 
 ```mermaid
 flowchart TD
-    A([message_bus: record_saved]) --> B{AGENT RESPONSE?}
-    B -- No --> Z([ignore])
-    B -- Yes --> C[enqueue chat_id, wake main loop]
+    USER(["User"])
 
-    C --> D[drain queue, dedup by chat_id]
-    D --> E[_process_pending_for_chat]
+    subgraph PARAM ["Parametric — model weights · immutable"]
+        PW["Drilling domain knowledge\nReasoning · Language · Physics"]
+    end
 
-    E --> F[get_chat_records\noldest_first=True, limit=TAIL_N+1]
-    F --> G{any records?}
-    G -- No --> H([return False])
-    G -- Yes --> I{oldest in tail?}
+    subgraph IC ["In-Context — assembled per request by MemoryService"]
+        MS["MemoryService · bundle_for_node"]
+        subgraph LOOP ["Ida · 5-node reasoning loop"]
+            direction LR
+            U["U\nUnderstand"] -->|state| P["P\nPlan"] --> Ex["Ex\nExecute"] --> Ev["Ev\nEvaluate"] --> A["A\nAnswer"]
+        end
+        SOUL["Soul + Agent.md + Skill.md"]
+        CHi["Chat History tail\nlast 12 exchanges"]
+        CSi["Cheatsheet\ncurated findings"]
+        UPi["User Profile\npreferences + conventions"]
+        PMi["Project Memory\ntop-K entities"]
+    end
 
-    I -- No, scrolled out --> L
-    I -- Yes, cursor_ts=None\nshort chat --> L
-    I -- Yes, cursor_ts set --> J{idle > 40 min?}
+    subgraph EPI ["Episodic — searchable history"]
+        RAG[("RAG index\nsource_type=CHAT\nall messages embedded")]
+        CRD[("chat_record\nstaged results · viz data")]
+    end
 
-    J -- No --> K([defer, return False])
-    J -- Yes, bypass --> L
+    subgraph EXT ["External — persistent structured storage"]
+        CS_DB[("chat.cheatsheet\nper-chat JSON\nverified · inferred · conflicted")]
+        HABIT[("chat.habit\nper-chat behaviour profile")]
+        subgraph AMEM ["agent_memory table"]
+            PROJ[("PROJECT scope\nentity_{well}\nproject_facts\nproject_lessons")]
+            USERP[("USER scope\nuser_profile")]
+            GLOB[("GLOBAL scope\ncursors · bookkeeping")]
+        end
+    end
 
-    L{record in _in_flight?}
-    L -- Yes --> M([blocked, return False])
-    L -- No --> N[add to _in_flight\nsubmit to executor]
+    subgraph BG ["Background agents — async, never block user requests"]
+        CC["ContextCompressor\n5s poll"]
+        CSA["CheatsheetAgent\nevent-driven + 120s fallback"]
+        HA["HabitAgent\n300s poll · 60min idle"]
+        CONS["ConsolidationAgent\n300s poll · 60min idle or 3h cursor gap"]
+    end
 
-    N --> O[_curate_record]
-    O --> P[find preceding user query]
-    P --> Q{query found?}
-    Q -- No --> R[advance cursor\nreturn False]
-    Q -- Yes --> S[CheatsheetService.update_cheatsheet\nLLM curator call ~15s]
-    S --> T[advance cheatsheet_cursor_ts]
-    T --> U[discard from _in_flight]
+    USER -->|request| MS
+    PARAM -.->|always active| LOOP
+    MS --> SOUL & CHi & CSi & UPi & PMi
+    SOUL & CHi & CSi & UPi & PMi --> LOOP
+    LOOP -->|answer| USER
 
-    style S fill:#f9f,stroke:#333
+    Ex -.->|"tool_read_chat_history\ntool_search_chat_history"| EPI
+    Ex -.->|"tool_read_cheatsheet\ntool_read_memory"| EXT
+
+    LOOP -->|new exchange| CC
+    CC -->|embed all messages| RAG
+    CC -->|compress > 2000 chars| CRD
+
+    LOOP -->|new AGENT RESPONSE event| CSA
+    CSA -->|curate per exchange| CS_DB
+
+    CS_DB & CRD -->|60min idle| HA
+    HA -->|extract habits| HABIT
+
+    CS_DB -->|60min idle\nor 3h cursor gap| CONS
+    HABIT -->|cross-session merge| CONS
+    CONS -->|promote verified\ndata_insights + key_facts| PROJ
+    CONS -->|promote verified+inferred\nlessons_learned| PROJ
+    CONS -->|merge user habits| USERP
+
+    CS_DB -->|static injection| MS
+    USERP -->|static injection| MS
+    PROJ -->|top-K retrieval| MS
+
+    style PARAM fill:#eee,stroke:#bbb
+    style IC fill:#e8f4e8,stroke:#9a9
+    style EPI fill:#e8e8f4,stroke:#99a
+    style EXT fill:#f4f4e8,stroke:#aa9
+    style BG fill:#f4e8e8,stroke:#a99
 ```
-
-**Key implementation details:**
-- `oldest_first=True` on `get_chat_records` ensures FIFO processing (fixes a DESC LIMIT bug that caused permanent skips)
-- `_in_flight: set[int]` prevents the same record being submitted twice while a slow LLM call is running across a 2s main loop cycle
-- `max_workers=4` allows up to 4 chats to curate in parallel; `_in_flight` serialises within each individual chat
-- Fallback poll every 120s recovers missed events after server restarts
-- Tail window size is configurable via `agent_config["tail_window_size"]`; defaults to 12
 
 ---
 
-## ConsolidationAgent
+## Layer 1: Parametric
 
-**Purpose:** Promote verified cheatsheet findings into persistent PROJECT-scoped `agent_memory` after a session goes idle. Enables cross-session recall without re-reading transcripts.
+**What it is:** knowledge baked into Claude's model weights — drilling terminology, physics, general reasoning, language understanding. Always active. Ida cannot modify this layer.
 
-**Condition to fire:** `cheatsheet_cursor_ts > consolidation_cursor_ts` AND last agent response older than 60 minutes. Both conditions must hold — the cursor comparison ensures only new cheatsheet content is consolidated on subsequent sessions.
+**What Ida uses it for:** baseline domain competence that does not need to be injected. Universal concepts (NPT, ROP, BHA, stuck pipe) are parametric knowledge — they do not need to be explained in every prompt. Operator-specific conventions, well-specific findings, and user preferences are *not* parametric — they must be injected from External or In-Context.
 
-**Storage:** `agent_memory` table, scope=PROJECT:
-- `entity_{well}` — per-well data insights (`{"well": "nnm101", "insights": [...]}`)
-- `project_facts` — data quality gaps, confirmed well characteristics
-- `project_lessons` — transferable operational insights
+**Design implication:** do not inject what Claude already knows. Reserve prompt budget for what is project-specific, session-specific, or user-specific.
+
+---
+
+## Layer 2: In-Context
+
+**What it is:** everything loaded into the active context window for a single request. Assembled by `MemoryService` before each LLM node call. Discarded after the response — nothing in this layer survives to the next request without being written to Episodic or External first.
+
+### Memory sources and injection map
+
+| Source | Typical size | U | P | Ex | Ev | A |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| Soul + Agent.md | ~2–3k | ✓ | ✓ | ✓ | ✓ | — |
+| Skill.md | ~1–2k | — | ✓ | ✓ | — | — |
+| Chat History tail (last 12) | ~4–6k | ✓ | ✓ | ◌ | — | — |
+| Cheatsheet | ~1–3k | ✓ | ✓ | ◌ | — | — |
+| User Profile | ~0.5–1k | ✓ | — | — | ✓ | — |
+| Project Memory (top-K) | ~1–2k | ↑ | — | ◌ | — | — |
+| U's state output | ~1–2k | — | ✓ | — | — | — |
+| **Total (U)** | **~9–15k** | | | | | |
+| **Total (P)** | **~8–14k** | | | | | |
+
+**✓** static injection · **↑** top-K retrieval by entity at node start · **◌** on demand via tool during execution · **—** not loaded
+
+### Why each node gets what it gets
+
+**Understand (U):** full picture — Soul, CH, CS, User Profile, top-K Project Memory retrieved by entity match. U synthesizes the query, identifies the relevant wells, recalls what is already known, and produces a structured state (intent, entities, known facts) for the rest of the loop.
+
+**Plan (P):** Soul + Skill.md + CH + CS + U's state. The planner needs the raw conversation and established findings to write a non-redundant execution plan. PM is the exception — P receives the relevant entries via U's state, so no direct PM injection at P.
+
+**Execute (Ex):** Soul + Skill.md + P's execution plan (as state). Most skills don't need CH/CS/PM injected — U and P already synthesized them. Tools cover on-demand access for the rare skill that needs to look something up mid-execution.
+
+**Evaluate (Ev):** Soul + User Profile + Ex's results (as state). Evaluates factual correctness *and* persona fit — did the answer match this user's detail level, domain knowledge, and output preferences?
+
+**Answer (A):** formats and returns Ex/Ev's output. No separate LLM call needed in the current design.
+
+### MemoryService
+
+`MemoryService` (`app/services/memory/memory_service.py`) assembles the in-context bundle before each node call. It is the Python-layer counterpart to the tools — the service runs before the LLM; tools run inside the LLM's execution loop.
+
+```python
+@dataclass
+class NodeContext:
+    system: str    # Soul + Agent.md (+ Skill.md for P and Ex)
+    context: str   # CH, CS, User Profile, retrieved PM
+    state: str     # structured output from the prior node
+
+class MemoryService:
+    def bundle_for_node(self, node: str, **kwargs) -> NodeContext: ...
+```
+
+```
+User request
+  └─ MemoryService.bundle_for_node("U", entities=[...])
+  └─ LLM call: Understand → produces u_state
+  └─ MemoryService.bundle_for_node("P", skill_name=..., u_state=...)
+  └─ LLM call: Plan → produces p_state
+  └─ MemoryService.bundle_for_node("Ex", skill_name=..., p_state=...)
+  └─ LLM call: Execute
+       ├─ tool_read_cheatsheet(...)     ← on demand
+       ├─ tool_read_memory(query=...)   ← on demand
+       └─ produces ex_state
+  └─ MemoryService.bundle_for_node("Ev", ex_state=...)
+  └─ LLM call: Evaluate
+```
+
+**Caching:** `soul`, `agent_md`, and `skill` files cached per request (disk reads). DB-backed loaders (`chat_history`, `cheatsheet`, `user_profile`, `retrieve_project_memory`) are not cached — they must reflect current DB state.
+
+### Tools for on-demand access during Execute
+
+Three tools support context loading mid-execution without pre-injecting:
+
+**`tool_read_cheatsheet(confidence, well)`** — reads `chat.cheatsheet`, optionally filtered. Primary use: verify a fact before running an expensive DDR/WellView retrieval — if `confidence="verified"` returns complete data, skip the query.
+
+**`tool_read_chat_history(n, before_record_id, oldest_first)`** — reads N raw exchanges beyond the injected tail. Primary use: report and reconciliation skills referencing exchanges from earlier than the current window.
+
+**`tool_read_memory(name, query, top_k)`** — reads from `agent_memory` by exact name or keyword match. Primary use in Execute: look up a specific entity not covered by the top-K injected at U.
+
+### Current vs target state
+
+| Source | Write path | Read path |
+|---|---|---|
+| Soul.md + Agent.md | Manual (checked in) | Injected at all nodes ✓ |
+| Skill.md | Manual (checked in) | Loaded on demand in P and Ex ✓ |
+| Chat History tail | Framework | Injected at U and P ✓ |
+| Cheatsheet | CheatsheetAgent ✓ | **Not yet injected** — target: U, P via MemoryService |
+| User Profile | HabitAgent ✓ | **Not yet read** — target: U and Ev via MemoryService |
+| Project Memory | ConsolidationAgent ✓ | **Not yet retrieved** — target: top-K at U via MemoryService |
+
+The write infrastructure is complete. The activation gap is MemoryService wiring (see Implementation Plan).
+
+---
+
+## Layer 3: Episodic
+
+**What it is:** a searchable record of past events — conversations, tool results, and staged visualisations. Survives across sessions and can be retrieved by content query, not just recency.
+
+### ContextCompressor
+
+Runs continuously (5s poll). Performs two jobs per chat record:
+
+```
+Job 1 — Embed:   ALL USER + AGENT messages → RAG index (source_type=CHAT)
+Job 2 — Compress: messages > 2000 chars → 300-word summary → chat_record.compressed_message
+```
+
+**Effect:** every message is searchable via `tool_search_chat_history`. Long messages are compressed so the in-context tail uses `compressed_message or message` — the cleanest available version.
+
+**Known issue:** after Job 2 runs, the RAG entry still holds the noisy original. Task 2.1 fixes this by re-indexing with `compressed_message` after compression.
+
+### Chat record data
+
+`chat_record` rows hold full message history, staged tool results, and visualisation payloads. The Chat Record Data toolbox provides structured access: `tool_list_chat_data_records`, `tool_get_record_data`. These are the mechanism for cross-turn data continuity within a session (e.g. chart data from turn 3 used in turn 7).
+
+### Episodic retrieval tools
+
+**`tool_search_chat_history(query, chat_id, top_k)`** — semantic search over the RAG index (`source_type=CHAT`). Returns ranked excerpts. `chat_id=None` searches project-wide (cross-chat retrieval). Already implemented; used by the orchestrator to avoid re-asking the user to confirm established data.
+
+**`tool_read_chat_history(n, before_record_id)`** — paginated raw access for skills that need chronological history beyond the injected tail (e.g. report generation, reconciliation).
+
+---
+
+## Layer 4: External
+
+**What it is:** persistent structured storage that survives across sessions and projects. Written by background agents asynchronously; read at session start via MemoryService or on demand via tools. This is what makes Ida remember.
+
+### Per-chat storage
+
+**`chat.cheatsheet` (JSON):** curated findings from the current session. Three buckets:
+
+```json
+{
+  "data_insights":   [{"content": "...", "confidence": "verified|inferred|conflicted", "well": "NNM-101", "record_id": 847}],
+  "key_facts":       [{"content": "...", "confidence": "verified|inferred|conflicted", "record_id": 801}],
+  "lessons_learned": [{"content": "...", "confidence": "verified|inferred", "well": "NNM-101", "record_id": 912}]
+}
+```
+
+Confidence rules: `verified` = value appears verbatim in a tool result block · `inferred` = derived from narrative · `conflicted` = same metric has two values; both entries preserved, neither silently dropped.
+
+**`chat.habit` (text):** per-session user behaviour profile extracted by HabitAgent. Five dimensions: query style, interaction style, output preferences, domain focus, expertise signals. Structured with `## DIMENSION` headers.
+
+### Cross-session storage (`agent_memory` table)
+
+| Scope | Key pattern | Written by | Content |
+|---|---|---|---|
+| PROJECT | `entity_{well}` | ConsolidationAgent | Per-well data insights (merged, deduped) |
+| PROJECT | `project_facts` | ConsolidationAgent | Data quality gaps, confirmed characteristics |
+| PROJECT | `project_lessons` | ConsolidationAgent | Transferable operational insights |
+| USER | `user_profile` | ConsolidationAgent (from `chat.habit`) | Persistent user preferences across all projects |
+| GLOBAL | `*_cursor` | All background agents | Bookkeeping: last processed record IDs |
+
+Schema: `agent_id`, `name`, `scope`, `project_id`, `user_id`, `object` (JSONB), `content_text` (FTS-indexed), `memory_type`, `confidence`, `version`.
+
+### Background agents
+
+Three agents run continuously alongside the main application. They never block a user request.
+
+#### CheatsheetAgent
+
+Maintains `chat.cheatsheet`. Event-driven: wakes immediately on `system.historian.record_saved` (AGENT RESPONSE); 120s fallback poll catches missed events.
+
+**3-phase tail logic:**
+- **Phase 1 (young chat, total ≤ tail_n):** curate immediately after each exchange
+- **Phase 2 (mature, unprocessed ≤ tail_n):** accumulate — defer until enough unprocessed records exist
+- **Phase 3 (sliding window, unprocessed > tail_n):** oldest unprocessed has scrolled past tail boundary — curate immediately
+- **Idle bypass (> 40 min):** flush all remaining tail records regardless of phase
+
+```mermaid
+flowchart TD
+    A([record_saved event\nor 120s fallback poll]) --> B{AGENT RESPONSE?}
+    B -- No --> Z([ignore])
+    B -- Yes --> C[enqueue chat_id]
+
+    C --> D[_get_next_record\nPhase 1 / 2 / 3 logic]
+    D --> E{record to curate?}
+    E -- No --> F([defer or done])
+    E -- Yes --> G{in _in_flight?}
+    G -- Yes --> F
+    G -- No --> H[add to _in_flight\nsubmit to executor]
+
+    H --> I[find preceding user query]
+    I --> J[CheatsheetService.update_cheatsheet\nLLM curator ~15s]
+    J --> K[advance cheatsheet_cursor_ts]
+    K --> L[discard from _in_flight]
+
+    style J fill:#f9f,stroke:#333
+```
+
+#### ConsolidationAgent
+
+Promotes verified cheatsheet findings to PROJECT-scoped `agent_memory`. Fires when `cheatsheet_cursor_ts > consolidation_cursor_ts` AND (idle > 60 min OR cursor gap > 3h).
 
 **Promotion rules:**
+
 | Bucket | What gets promoted |
 |---|---|
 | `data_insights` | `confidence == "verified"` only |
 | `key_facts` | `confidence == "verified"` only |
 | `lessons_learned` | `confidence in ("verified", "inferred")` |
 
-### Workflow
-
 ```mermaid
 flowchart TD
-    A([poll every 300s]) --> B[get_chats_needing_consolidation\ncheatsheet_cursor > consolidation_cursor\nAND idle > 60 min OR cursor_gap > 3h]
+    A([poll every 300s]) --> B[get_chats_needing_consolidation\nidle > 60min OR cursor_gap > 3h]
     B --> C{any chats?}
     C -- No --> A
     C -- Yes --> D[for each chat]
 
-    D --> E[get_chat_cheatsheet]
-    E --> F{empty or legacy text?}
-    F -- Yes --> G[advance consolidation_cursor\nskip]
-    F -- No --> H[parse CheatsheetData]
+    D --> E[parse chat.cheatsheet]
+    E --> F{empty or legacy?}
+    F -- Yes --> G[advance cursor · skip]
+    F -- No --> H[filter verified data_insights\ngroup by well]
 
-    H --> I[filter verified data_insights\ngroup by well, normalize key\nNNM-101 → nnm101]
-    I --> J[read existing PROJECT memory]
-    J --> K[LLM synthesis or _dedupe fallback]
-    K --> L[set_object entity_well]
+    H --> I[read existing entity_well from agent_memory]
+    I --> J[LLM synthesis or _dedupe]
+    J --> K[set_object entity_well · scope=PROJECT]
 
-    L --> M[filter verified key_facts]
-    M --> N[LLM synthesis or _dedupe]
-    N --> O[set_object project_facts]
+    K --> L[filter verified key_facts]
+    L --> M[LLM synthesis or _dedupe]
+    M --> N[set_object project_facts]
 
-    O --> P[filter verified + inferred lessons]
-    P --> Q[LLM synthesis or _dedupe]
-    Q --> R[set_object project_lessons]
+    N --> O[filter verified+inferred lessons]
+    O --> P[LLM synthesis or _dedupe]
+    P --> Q[set_object project_lessons]
 
-    R --> S[advance consolidation_cursor_ts]
+    Q --> R[advance consolidation_cursor_ts]
 
-    style K fill:#f9f,stroke:#333
-    style N fill:#f9f,stroke:#333
-    style Q fill:#f9f,stroke:#333
+    style J fill:#f9f,stroke:#333
+    style M fill:#f9f,stroke:#333
+    style P fill:#f9f,stroke:#333
 ```
 
-**LLM synthesis prompt:** merges existing + new facts, deduplicates, resolves numerical conflicts, and returns a clean JSON array. Falls back to simple case-insensitive `_dedupe` if LLM is unavailable.
+**LLM synthesis prompt:** merges existing + new facts, deduplicates, resolves numerical conflicts (appends "values vary: X, Y" when unresolvable), returns a clean JSON array. Falls back to case-insensitive `_dedupe` if LLM is unavailable.
 
----
+#### HabitAgent
 
-## HabitAgent
-
-**Purpose:** Learn how each user prefers to work with Ida — query style, output preferences, domain knowledge level — and store this as a USER-scoped profile that persists across all sessions and projects.
-
-**Storage:** `agent_memory` table, scope=USER, name=`user_profile` — a free-text profile structured with markdown headers.
-
-**Condition to fire:** chat idle for 60 minutes with unprocessed records since `habit_cursor_ts`.
-
-### Workflow
+Extracts per-user behavioural patterns at session end. Fires when a chat has been idle for 60 minutes with unprocessed records since `habit_cursor_ts`.
 
 ```mermaid
 flowchart TD
-    A([poll every N seconds]) --> B[get_idle_chats\nidle > 60 min]
+    A([poll every 300s]) --> B[get_idle_chats\nidle > 60min]
     B --> C{any chats?}
     C -- No --> A
     C -- Yes --> D[for each idle chat]
 
     D --> E[get user_id from chat]
     E --> F{user_id found?}
-    F -- No --> G[advance cursor, skip]
-    F -- Yes --> H[load transcript since habit_cursor_ts\nuser + agent records]
+    F -- No --> G[advance cursor · skip]
+    F -- Yes --> H[load transcript since habit_cursor_ts]
 
     H --> I{any records?}
-    I -- No --> J([return False])
-    I -- Yes --> K[get existing USER profile\nfrom agent_memory]
+    I -- No --> A
+    I -- Yes --> J[load existing USER profile\nfrom agent_memory]
 
-    K --> L[LLM: extract habits from transcript\nmerge with existing profile]
-    L --> M{habits tag in response?}
-    M -- No --> N[advance cursor\nno write]
-    M -- Yes --> O[set_object user_profile\nscope=USER]
-    O --> P[advance habit_cursor_ts]
+    J --> K[LLM: extract habits · merge with existing]
+    K --> L{habits tag present?}
+    L -- No --> M[advance cursor · no write]
+    L -- Yes --> N[set_object user_profile · scope=USER]
+    N --> O[advance habit_cursor_ts]
 
-    style L fill:#f9f,stroke:#333
+    style K fill:#f9f,stroke:#333
 ```
+
+---
+
+## Session Boundary Model
+
+Three idle thresholds govern when each memory layer flushes or promotes:
+
+```
+Active session
+  └─ exchanges scroll out of TAIL_WINDOW (12) → CheatsheetAgent curates (Phase 3)
+  └─ every 3h of cursor gap → ConsolidationAgent fires mid-session
+
+t=0       user stops
+t=40 min  IDLE_BYPASS_THRESHOLD → CheatsheetAgent flushes remaining tail records
+t=60 min  ConsolidationAgent → promotes verified cheatsheet entries to PROJECT memory
+t=60 min  HabitAgent → extracts habits from transcript → USER memory
+```
+
+The 20-minute gap between cheatsheet flush (40 min) and consolidation (60 min) is intentional: ConsolidationAgent reads the cheatsheet, so it must be fully settled first.
+
+**Long active sessions:** ConsolidationAgent also fires when the gap between `cheatsheet_cursor_ts` and `consolidation_cursor_ts` exceeds 3 hours, regardless of session activity. An 8-hour working session triggers mid-session consolidation at least twice. Subsequent runs process only new entries — no duplication.
 
 ---
 
 ## What Works Well
 
-**Incrementality.** All three agents use cursor timestamps to track progress. Restarts, crashes, and slow LLM calls are all safe — work resumes from where it left off, never reprocessed.
+**Incrementality.** All three background agents use per-chat cursor timestamps. Restarts, crashes, and slow LLM calls are safe — work resumes from where it left off, never reprocessed.
 
-**Clean confidence model.** The `verified / inferred / conflicted` distinction in the cheatsheet is meaningful and enforced: only `verified` entries reach long-term memory. Conflicted entries are preserved in full — both values are kept, neither is silently dropped.
+**Clean confidence model.** The `verified / inferred / conflicted` distinction is enforced end-to-end: only `verified` entries reach `agent_memory`. Conflicted entries are preserved in full — both values kept, neither silently dropped.
 
-**Correct FIFO ordering.** The `oldest_first=True` fix ensures the cheatsheet processes exchanges in the order they happened. Before this fix, DESC LIMIT caused the oldest records to be permanently skipped when 4+ exchanges accumulated.
+**Correct FIFO ordering.** `oldest_first=True` on `get_chat_records` ensures FIFO processing. Before this fix, DESC LIMIT caused the oldest records to be permanently skipped when 4+ exchanges accumulated.
 
-**In-flight dedup.** The `_in_flight` set prevents the same exchange being submitted twice while its LLM call is running. Without it, every 2-second main loop cycle would re-submit the same record, clogging the executor.
+**Non-blocking.** All curation, consolidation, and habit extraction happen in background threads. The user never waits for memory work.
 
-**Session boundary model is coherent.** The 40/60-minute thresholds (cheatsheet flush → consolidation) have a 20-minute safety margin. ConsolidationAgent cannot race ahead of CheatsheetAgent.
-
-**No LLM calls block user requests.** All curation, consolidation, and habit extraction happen in background threads. The user never waits for memory work.
+**Session boundary coherence.** The 40/60-minute thresholds have a 20-minute safety margin — ConsolidationAgent cannot race ahead of CheatsheetAgent.
 
 ---
 
 ## Honest Problems
 
-### 1. Sub-agents don't read from memory (the biggest gap)
+### 1. In-context injection not yet wired (the biggest gap)
 
-`tool_read_memory` and `tool_upsert_memory` exist and work. No sub-agent AGENT.md currently instructs a memory read at session start. The PROJECT-scoped memories written by ConsolidationAgent and the USER-scoped profiles written by HabitAgent are never loaded into the LLM context. The infrastructure is complete; the activation is missing.
+The External layer write infrastructure is complete. MemoryService is not yet wired into Ida. The PROJECT-scoped memories written by ConsolidationAgent and the USER-scoped profiles written by HabitAgent are never loaded into the LLM context. **Impact:** Ida forgets everything between sessions.
 
-**Impact:** IDA forgets everything between sessions. A returning user gets no benefit from previous consolidated findings.
+### 2. Cheatsheet injected without confidence filtering
 
-### 2. Cheatsheet curation lags during fast sessions
+The injection design passes all confidence levels to the reasoning nodes. `conflicted` entries — two contradictory values for the same metric — can mislead U or P, which may pick one value arbitrarily. Fix: prefix `conflicted` entries with `[CONFLICTED — two values reported: X, Y]` in `MemoryService.load_cheatsheet()`.
 
-Each curator LLM call takes ~15s. During fast interactions (15–20s between exchanges), the cheatsheet can fall several exchanges behind the active conversation. The tail protection defers the last 12 exchanges deliberately, but during the active session the cheatsheet cursor and the raw context window (12–15 exchanges) can leave a gap of uncovered exchanges that appear in neither.
+### 3. Evaluate node lacks a quality rubric
 
-**Specifically:** IDA agent loads 12 raw exchanges, SME agent loads 15. TAIL_N=12 means the 3 oldest of the SME's 15 loaded exchanges are curated AND in raw context — mild redundancy. More importantly, if the cheatsheet lags significantly, exchanges between the cheatsheet cursor and the raw window start are not covered by either.
+User Profile is injected at Ev (persona-aware evaluation), but explicit quality criteria are missing — Ev can only check factual surface correctness without them. Fix: add a rubric to the Evaluate section of AGENT.md (every numerical claim must cite a tool result; conflicted entries must be flagged; response depth must match user profile).
 
-**Current mitigation:** none. The gap closes at idle flush (40 min).
+### 4. Cheatsheet curation lags during fast sessions
 
-### 3. Simple dedup fallback is not semantic
+Each curator LLM call takes ~15s. During fast interactions (15–20s between exchanges), the cheatsheet can fall several exchanges behind. The gap closes at idle flush (40 min) — no fix needed short-term, but worth monitoring during soak.
+
+### 5. Simple dedup fallback is not semantic
 
 When the LLM is unavailable, `_dedupe` falls back to case-insensitive string equality. "NPT: 54.2 hrs" and "NPT was 54 hours" are treated as different facts and both promoted. The LLM synthesis prompt handles this correctly; the fallback does not.
 
-### 4. No memory staleness or conflict resolution across chats
+### 6. No cross-session conflict resolution
 
-If chat A reports NPT = 54h and chat B reports NPT = 71h for the same well, both get promoted to `entity_nnm101.insights` as separate strings (via `_dedupe`). The cheatsheet handles intra-session conflicts with the `conflicted` confidence level, but ConsolidationAgent has no equivalent mechanism across sessions. The LLM synthesis prompt is supposed to detect this ("values vary: X, Y"), but it is not guaranteed.
+If chat A reports NPT = 54h and chat B reports NPT = 71h for the same well, both are promoted to `entity_nnm101.insights`. The LLM synthesis prompt is designed to detect this ("values vary: X, Y"), but is not guaranteed to catch all cases.
 
-### 5. Well key normalisation is lossy
+### 7. Well key normalisation is lossy
 
-`_normalize_entity_key("NNM-101")` → `"nnm101"`. This collapses NNM-101 and NNM101 into the same key, which is intentional. But it also collapses hypothetical wells like NNM-10 and NNM-1-0 (if they existed). The normalisation is simple and works for the current well naming convention, but is not robust to arbitrary naming schemes.
-
-### 6. Hardcoded DB credentials in the live test
-
-`test_cheatsheet_live.py` contains `postgresql://ida:ida1793@localhost:5432/ida`. This is fine for local dev but must not be used as-is in any shared or CI environment.
-
-### 7. HabitAgent fires at the same threshold as ConsolidationAgent (60 min)
-
-Both agents fire at 60-minute idle. In practice this means both run simultaneously after a session ends. HabitAgent reads the full transcript; ConsolidationAgent reads the cheatsheet. There is no coordination — they run independently and write to different tables, which is fine. But the ordering is not guaranteed: HabitAgent could write a user profile before ConsolidationAgent has finished merging facts from the same session. This is harmless today but worth noting if ordering ever matters.
-
----
-
-## Memory Injection into the Agent Workflow
-
-Ida is a single agent running a five-node reasoning loop: **Understand → Plan → Execute → Evaluate → Answer**. There are no sub-agents. Each node receives a subset of available memory — injected statically into the prompt, or loaded dynamically via tool call. The injection pattern determines what Ida knows at each step.
-
-### Injection map
-
-| Memory source | U | P | Ex | Ev | A |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Soul + Agent.md | ✓ | ✓ | ✓ | ✓ | — |
-| CH + CS | ✓ | ✓ | ◌ | — | — |
-| User Profile | ✓ | — | — | ✓ | — |
-| Project Memory | ↑ | — | ◌ | — | — |
-| Skill.md | — | ✓ | ✓ | — | — |
-
-**✓** inject (static, always in prompt) · **↑** retrieve top-K by entity at node start · **◌** on demand via tool · **—** not loaded · P also receives U's state output (intent, entities, known facts) — not listed as a memory source since it is produced within the workflow
-
-### Workflow diagram
-
-```mermaid
-flowchart TD
-    soul(["Soul + Agent.md"])
-    ep(["CH · CS"])
-    up(["User Profile"])
-    pm(["Project Mem"])
-    sk(["Skill.md"])
-
-    U["U"] -->|state| P["P"] --> Ex["Ex"] --> Ev["Ev"] --> A["A"]
-
-    soul --> U
-    soul --> P
-    soul --> Ex
-    soul --> Ev
-
-    ep --> U
-    ep --> P
-    ep -.->|tool| Ex
-
-    up --> U
-    up --> Ev
-
-    pm -.->|top-K| U
-    pm -.->|tool| Ex
-
-    sk -.->|tool| P
-    sk -.->|tool| Ex
-
-    style soul fill:#dde,stroke:#99a
-    style ep fill:#dfd,stroke:#9a9
-    style up fill:#dfd,stroke:#9a9
-    style pm fill:#ffd,stroke:#aa9
-    style sk fill:#ffd,stroke:#aa9
-```
-
-### Context load
-
-| Source | Typical size | U | P |
-|---|---|:---:|:---:|
-| Soul + Agent.md | ~2–3k | ✓ | ✓ |
-| CH (last 12 exchanges) | ~4–6k | ✓ | ✓ |
-| CS | ~1–3k | ✓ | ✓ |
-| User Profile | ~0.5–1k | ✓ | — |
-| Project Memory (top-K) | ~1–2k | ↑ | — |
-| U's state output | ~1–2k | — | ✓ |
-| **Total** | | **~9–15k** | **~8–14k** |
-
-P needs CH and CS directly: the planner must read the raw conversation and established findings to write a non-redundant execution plan, not just U's interpretation of them. PM is the exception — P receives those via U's state (which already carried the relevant top-K entries), so no direct PM injection at P.
-
-**CH and CS overlap.** The cheatsheet is a curated distillation of older exchanges. They are complementary as long as CH is bounded to recent exchanges (last N) — CS covers history prior to the window. No redundancy if this bound is enforced.
-
-### Why each node gets what it gets
-
-**U gets the full picture — including top-K project memory retrieval.** U's job is to synthesize: interpret the query, identify the relevant entities and wells, recall what is already known about them, and produce a structured state for the rest of the workflow. PM is retrieved by entity match at the start of U, not dumped wholesale. The retrieved entries travel forward in U's state output.
-
-**P gets CH, CS, and U's state — but not PM.** The planner needs the raw conversation (CH) and established findings (CS) to write a non-redundant execution plan — U's interpretation of them is not a substitute. PM is the exception: P receives the relevant entries via U's state output (which already captured the top-K retrieved subset), so no direct PM injection at P is needed.
-
-**Soul + Agent.md in all reasoning nodes.** Small, stable, and essential for grounding every step. Omitting them causes behavioral drift.
-
-**User Profile in U and Ev.** In U it shapes how the query is interpreted. In Ev it grounds the evaluation: did the answer match this user's detail level, domain knowledge, and output preferences? Without it, Ev can only check factual correctness, not whether the response was right for this person.
-
-**Skill.md in P and Ex.** P needs the skill's approach and constraints to write a correct execution plan — scheduling tool calls without knowing the skill's required sequence produces an invalid plan. Ex uses it to guide step-by-step execution. Both nodes load it via `tool_load_skill` once the task type is resolved.
-
-**CH, CS, and PM optionally in Ex.** Most skills don't need them — U/P already provided the context. But a skill verifying a specific fact mid-execution, looking up a long-ago exchange, or retrieving memory for a newly identified entity can do so via tool without re-injecting the full payload.
-
-### Tools for CH, CS, and Project Memory access in Execute
-
-Three tools support on-demand context loading in Execute:
-
-**`tool_read_cheatsheet`** — reads `chat.cheatsheet`, optionally filtered by confidence level or well name. Primary use: verify a fact before running an expensive retrieval tool. Example: `tool_read_cheatsheet(confidence="verified", well="NNM-101")` returns known facts about that well; if complete, skip the DDR query.
-
-**`tool_read_chat_history`** — reads N raw message exchanges from `chat_record` with optional offset. Needed when a skill requires context beyond the exchanges injected in P — for example, a report skill referencing an exchange from 20 turns back.
-
-**`tool_read_memory`** — already exists; reads from `agent_memory` by scope, name, and memory type. Covers project memory retrieval in Execute for skills that need to look up a specific entity that wasn't in the injected project memory summary.
-
-`tool_read_cheatsheet` and `tool_read_chat_history` are new additions; both are thin wrappers over existing DB queries and belong in `mem_storage_toolbox.py`. `tool_read_memory` is already implemented.
-
-### Current vs target state
-
-| Memory source | Write path | Read path |
-|---|---|---|
-| Soul.md + Agent.md | Manual (checked in) | Injected in current prompts ✓ |
-| Chat History | Framework (`load_message_history`) | Loaded in U ✓ |
-| Cheatsheet | CheatsheetAgent ✓ | **Not yet injected in U** |
-| User Profile | HabitAgent ✓ | **Not yet read** |
-| Project Memory | ConsolidationAgent ✓ | **Not yet retrieved in U** (entity-match top-K) |
-| Skill.md | Manual (checked in) | Loaded on demand in Ex ✓ |
-
-The write infrastructure is complete. The remaining work is activation: inject cheatsheet, user profile, and project memory into the U/P prompts in `AGENT.md`.
-
----
-
-### Industry practice review
-
-#### What aligns well
-
-**Skill.md on demand (RAG-over-instructions).** Dynamically loading task instructions based on the resolved intent is the correct pattern, used in production by OpenAI function schemas, LangChain tool descriptions, and retrieval-augmented instruction systems. Loading Skill.md upfront at every node would be expensive and brittle.
-
-**User Profile in U only.** Consistent with how personalization is handled in production assistants. Preferences shape interpretation, not planning logic. Injecting them beyond U adds tokens without value.
-
-**Background agents for memory maintenance.** Running CheatsheetAgent, ConsolidationAgent, and HabitAgent asynchronously — never blocking a user request — is the standard production pattern. Synchronous memory maintenance during inference is an anti-pattern because it adds latency to the critical path.
-
-**Cursor-based incremental processing.** Correct. Timestamp cursors are the industry-standard mechanism for durable, resumable streaming pipelines (used in Kafka consumers, CDC systems, and production agent memory backends like Zep).
-
-**Tool-based access for CH, CS, PM in Execute.** The on-demand retrieval pattern for archival memory is well-established (MemGPT's archival memory, OpenAI's file search). Making tools the access path — rather than always-injecting — is correct for content that is large, selective, and query-specific.
-
----
-
-#### Concerns
-
-**1. Project memory full-dump — fixed.**
-
-~~The current design injects all project memory into U and P unconditionally.~~ **Resolved:** PM is retrieved by entity match at the start of U (top-K, not full-dump). The retrieved entries travel forward in U's state output to P; P has no direct PM injection. For IDA's current scale, entity-based filtering (by well name extracted from the query) is sufficient. Semantic embedding search over `content_text` is the natural next step when entity matching is insufficient.
-
-**2. Re-injecting raw sources at both U and P — partially fixed.**
-
-PM is fully resolved: P receives it only via U's state, not as a direct injection. CH and CS are intentionally re-injected at P: the planner needs the raw conversation and established findings to write a correct execution plan, not just U's synthesis of them. The remaining duplication (CH+CS in both U and P) is a deliberate trade-off — the context cost (~8–14k at P) is acceptable, and removing it would risk under-informed planning.
-
-**3. Cheatsheet is injected without confidence filtering.**
-
-The cheatsheet has three confidence levels: `verified`, `inferred`, and `conflicted`. The injection design injects all of them. Presenting `conflicted` entries — two contradictory values for the same metric — to a reasoning node as flat context is unreliable: the model may pick one value arbitrarily without recognizing the conflict.
-
-Industry practice for structured entity stores (e.g., knowledge graphs, Weaviate filtered retrieval) is to filter or label by confidence at read time. Two options:
-
-- **Hard filter:** inject only `verified` entries into U and P as established facts; skip `inferred` and `conflicted` entirely (they remain available via `tool_read_cheatsheet` for skills that need them).
-- **Labeled injection:** include all entries but prefix conflicted entries with an explicit marker: `[CONFLICTED — two values reported: X, Y]`. This preserves the information while preventing silent misuse.
-
-**4. Evaluate grounding — partially fixed.**
-
-User Profile is now injected into Ev, enabling persona-aware evaluation: did the answer match this user's detail level, domain knowledge, and output preferences? The remaining gap — explicit quality criteria (e.g., "every numerical claim must cite a tool result") — belongs in the Evaluate section of `AGENT.md` as a rubric, not as additional memory injection.
-
----
-
-#### Summary
-
-| Decision | Assessment |
-|---|---|
-| Skill.md in P and Ex | ✓ Correct — planner needs skill constraints |
-| User Profile in U and Ev | ✓ Fixed — Ev now persona-aware |
-| Background agents, cursor-based | ✓ Correct |
-| Tool access for CH/CS/PM in Ex | ✓ Correct |
-| PM top-K retrieval in U, state to P | ✓ Fixed — entity-conditioned, not full-dump |
-| CH + CS in both U and P; PM via state | ~ Deliberate — CH/CS needed by planner; PM fixed |
-| Cheatsheet injected without confidence filter | ✗ Risk of conflicted entries misleading reasoning |
-| Ev quality rubric | ✗ Still missing — belongs in Ev section of AGENT.md |
+`_normalize_entity_key("NNM-101")` → `"nnm101"`. Works for current naming conventions; not robust to arbitrary schemes.
 
 ---
 
 ## Implementation Plan
 
-Two parallel tracks: (1) the tools the LLM calls mid-execution to pull additional context; (2) the `MemoryService` that assembles the initial prompt context before each LLM call. These are complementary — the service handles static injection and top-K retrieval at node entry; the tools handle on-demand access during execution.
+Two parallel tracks: (1) tools for on-demand context access during Execute; (2) MemoryService for static injection before each node. These are complementary.
 
 ```
-Before LLM call        During LLM execution
-─────────────────      ──────────────────────
-MemoryService          tool_read_chat_history
- └─ bundle_for_node     tool_read_cheatsheet
-     CH, CS, Profile    tool_read_memory (top-K)
-     Soul, Agent.md
-     Skill.md
-     PM (top-K)
+Before LLM call (MemoryService)    During LLM execution (tools)
+────────────────────────────────   ─────────────────────────────
+bundle_for_node:                   tool_read_cheatsheet (upgrade)
+  Soul + Agent.md + Skill.md       tool_read_chat_history (new)
+  CH tail (12 exchanges)           tool_read_memory top-K (upgrade)
+  CS (confidence-filtered)
+  User Profile
+  PM top-K entities
 ```
 
----
+### Step 1 — Upgrade `tool_read_cheatsheet` with `confidence` / `well` filters
+Tool already exists. Add filter params; parse with `parse_cheatsheet()`; return markdown per bucket. Unfiltered call unchanged. **Risk: low.**
 
-### Step 1 — `tool_read_cheatsheet`
+### Step 2 — New `tool_read_chat_history`
+`get_chat_records(chat_id, limit=n*2, before_record_id=..., oldest_first=...)` → paired transcript with `[User]` / `[Ida]` prefixes. Prefers `compressed_message or message`. **Risk: low.**
 
-**File:** `app/agents/tools/toolbox/mem_storage_toolbox.py`
-
-The current `tool_read_memory` reads from `agent_memory` (cross-session). It does not touch `chat.cheatsheet` (per-chat). A separate tool is needed.
-
-```python
-# args_schema
-{
-  "confidence": {
-    "type": "string",
-    "enum": ["verified", "inferred", "conflicted"],
-    "description": "Filter entries by confidence level. Omit to return all."
-  },
-  "well": {
-    "type": "string",
-    "description": "Filter to a specific well name (normalised: NNM-101 → nnm101). Omit for all wells."
-  }
-}
-# passthrough_params: chat_id, project_id, session_id, trace_id
-```
-
-Implementation: call `project_service.get_chat_cheatsheet(chat_id)`, parse with `parse_cheatsheet()`, filter by `confidence` and `_normalize_entity_key(well)`, return formatted text grouped by bucket (`data_insights`, `key_facts`, `lessons_learned`).
-
-Primary use in Execute: verify a known fact before running an expensive retrieval tool. If `confidence="verified"` returns complete data for the queried well, the DDR/WellView query can be skipped.
-
----
-
-### Step 2 — `tool_read_chat_history`
-
-**File:** `app/agents/tools/toolbox/mem_storage_toolbox.py`
-
-The framework injects recent exchanges via `load_message_history()`. This tool provides access to exchanges outside that window — older history or history from a specific point.
-
-```python
-# args_schema
-{
-  "n": {
-    "type": "integer",
-    "default": 20,
-    "description": "Number of exchanges (user+agent pairs) to return."
-  },
-  "before_record_id": {
-    "type": "integer",
-    "description": "Return exchanges before this record ID. Use to page backwards through history."
-  },
-  "oldest_first": {
-    "type": "boolean",
-    "default": true
-  }
-}
-# passthrough_params: chat_id, project_id, session_id, trace_id
-```
-
-Implementation: call `project_service.get_chat_records(chat_id, limit=n*2, before_record_id=..., oldest_first=...)`, pair user and agent records chronologically, return as formatted transcript.
-
-Primary use in Execute: report and reconciliation skills that need to reference exchanges from earlier in the conversation than the injected window covers.
-
----
-
-### Step 3 — Extend `tool_read_memory` for top-K entity retrieval
-
-**File:** `app/agents/tools/toolbox/mem_storage_toolbox.py` (existing tool)
-
-Current behaviour: exact name lookup (`name="entity_nnm101"`). Add a `query` parameter that performs entity/keyword matching against `name` and `content_text`, returning the top-K most relevant entries.
-
-```python
-# additional args_schema fields
-{
-  "query": {
-    "type": "string",
-    "description": "Entity or keyword search against memory name and content. Returns top_k matches. Use instead of 'name' for broad retrieval."
-  },
-  "top_k": {
-    "type": "integer",
-    "default": 5,
-    "description": "Maximum number of entries to return when using 'query'."
-  }
-}
-```
-
-Implementation (Phase 1 — keyword match): when `query` is provided, fetch all PROJECT-scoped entries for `project_id`, rank by: (a) well name present in `name`, (b) keyword overlap with `content_text`. Return top-K.
-
-Implementation (Phase 2 — semantic search): add an `embedding` vector column to `agent_memory`, embed `content_text` at write time (ConsolidationAgent), use pgvector cosine similarity at read time. Phase 1 is sufficient for current project scale.
-
-This is also the tool `MemoryService.retrieve_project_memory()` calls internally — the service is not a separate DB path, it composes the same tools.
-
----
+### Step 3 — Upgrade `tool_read_memory` with `query` / `top_k`
+Add keyword match over `name` + `content_text` for PROJECT-scoped entries. Existing name-lookup unchanged when `query` absent. Phase 2 (Q3): pgvector cosine similarity. **Risk: low.**
 
 ### Step 4 — `MemoryService`
-
-**File:** `app/services/memory/memory_service.py`
-
-The service assembles the initial prompt context for each node before the LLM call. It is the Python-layer counterpart to the tool functions — tools run inside the LLM execution loop; the service runs in the framework before each node is invoked.
-
-#### Data structures
-
-```python
-@dataclass
-class NodeContext:
-    system: str       # system prompt: soul + agent.md (+ skill.md for P and Ex)
-    context: str      # injected context block: CH, CS, user profile, retrieved PM
-    state: str = ""   # structured output from prior node (U→P, P→Ex)
-```
-
-#### Interface
-
-```python
-class MemoryService:
-    def __init__(
-        self,
-        project_service: ProjectService,
-        agent_memory_service: AgentMemoryService,
-        chat_id: int,
-        project_id: int,
-        user_id: int,
-    ): ...
-
-    # Individual loaders
-    def load_soul(self) -> str
-    def load_agent_md(self) -> str
-    def load_skill(self, skill_name: str) -> str
-    def load_chat_history(self, n: int = 12) -> str
-    def load_cheatsheet(self, confidence: str = None) -> str
-    def load_user_profile(self) -> str
-    def retrieve_project_memory(self, entities: list[str], top_k: int = 5) -> str
-
-    # Node bundles — standard assembly per the injection map
-    def bundle_for_node(self, node: str, **kwargs) -> NodeContext
-```
-
-#### `bundle_for_node` mapping
-
-```python
-match node:
-    case "U":
-        system  = soul + agent_md
-        context = chat_history(12) + cheatsheet() + user_profile()
-                  + retrieve_project_memory(entities=kwargs["entities"])
-    case "P":
-        system  = soul + agent_md + skill(kwargs["skill_name"])
-        context = chat_history(12) + cheatsheet()
-        state   = kwargs["u_state"]   # structured output from U
-    case "Ex":
-        system  = soul + agent_md + skill(kwargs["skill_name"])
-        context = ""                  # tools handle on-demand loading
-        state   = kwargs["p_state"]   # execution plan from P
-    case "Ev":
-        system  = soul + agent_md
-        context = user_profile()
-        state   = kwargs["ex_state"]  # results from Ex
-```
-
-#### Caching
-
-`soul`, `agent_md`, and `skill` files are read from disk once per request and cached in `self._cache`. DB-backed loaders (`chat_history`, `cheatsheet`, `user_profile`, `retrieve_project_memory`) are not cached — they must reflect current DB state.
-
-#### Where it fits in the call stack
-
-```
-User request
-  └─ Ida agent (Python)
-       ├─ memory_service.bundle_for_node("U", entities=[...])  ← MemoryService
-       ├─ LLM call: Understand node
-       │    └─ produces u_state (intent, entities, known facts)
-       ├─ memory_service.bundle_for_node("P", skill_name=..., u_state=...)
-       ├─ LLM call: Plan node
-       │    └─ produces p_state (execution plan)
-       ├─ memory_service.bundle_for_node("Ex", skill_name=..., p_state=...)
-       ├─ LLM call: Execute node
-       │    ├─ tool_read_cheatsheet(...)        ← tool (LLM-driven)
-       │    ├─ tool_read_memory(query=...)      ← tool (LLM-driven)
-       │    └─ produces ex_state (results)
-       ├─ memory_service.bundle_for_node("Ev", ex_state=...)
-       └─ LLM call: Evaluate node
-```
-
----
+New `app/services/memory/memory_service.py`. `bundle_for_node` assembles `NodeContext(system, context, state)` per the injection map. File-backed loaders (`soul`, `agent_md`, `skill`) cached per request; DB-backed loaders not cached. Unit tests mock `project_service` and `agent_memory_service`. **Risk: medium.**
 
 ### Step 5 — Wire into Ida
+Instantiate `MemoryService` at request entry. Replace manual prompt construction with `bundle_for_node`. Pass state through U→P→Ex→Ev. Update AGENT.md for all five nodes. Feature flag `IDA_MEMORY_SERVICE=true` until validated on two live sessions. **Risk: high.**
 
-Once Steps 1–4 are complete, the activation work is:
+### Step 6 — Confidence filtering + Ev rubric
+In `MemoryService.load_cheatsheet()`: prefix `conflicted` entries with `[CONFLICTED — ...]`. Add Ev quality rubric to `AGENT.md` Evaluate section. **Risk: low.**
 
-1. **Instantiate `MemoryService`** at request entry in the Ida agent Python code, passing `chat_id`, `project_id`, `user_id`.
-2. **Replace manual prompt construction** at each node with `bundle_for_node(node, ...)`.
-3. **Update `AGENT.md`** — add instructions for each node to describe what context it receives and what structured state it must produce (especially U, which must emit `entities` for PM retrieval at the next call).
-4. **Register the two new tools** (`tool_read_cheatsheet`, `tool_read_chat_history`) in `mem_storage_toolbox.py` and wire them via `register_tools()`.
-
-#### Sequencing
+### Sequencing
 
 | Step | Dependency | Risk |
 |---|---|---|
-| 1 — `tool_read_cheatsheet` | None | Low — thin wrapper over existing DB query |
-| 2 — `tool_read_chat_history` | None | Low — thin wrapper over existing DB query |
-| 3 — extend `tool_read_memory` | None | Low — additive, existing name lookup unchanged |
-| 4 — `MemoryService` | Steps 1–3 | Medium — new abstraction, needs tests |
-| 5 — Wire into Ida | Step 4 | High — changes prompt construction for every node |
-
-Steps 1–3 are independent and can be done in parallel. Step 4 depends on 1–3 only for its internal `retrieve_project_memory` call; the rest of its loaders are standalone. Step 5 is the highest-risk step and should be done behind a feature flag or tested on a non-production chat first.
+| 1–3 (tool upgrades) | None — parallel | Low |
+| 4 (MemoryService) | 1–3 for internal loaders | Medium |
+| 5 (wire into Ida) | 4 | High |
+| 6 (filtering + rubric) | 4 | Low |
 
 ---
 
@@ -649,19 +482,21 @@ Steps 1–3 are independent and can be done in parallel. Step 4 depends on 1–3
 
 ```
 chat
-  cheatsheet              TEXT         — JSON CheatsheetData, updated by CheatsheetAgent
+  cheatsheet              TEXT         — JSON CheatsheetData, written by CheatsheetAgent
   cheatsheet_cursor_ts    TIMESTAMP    — last exchange processed by CheatsheetAgent
   consolidation_cursor_ts TIMESTAMP    — last cheatsheet state consolidated to agent_memory
+  habit                   TEXT         — per-session user behaviour profile (HabitAgent)
   habit_cursor_ts         TIMESTAMP    — last exchange processed by HabitAgent
 
 agent_memory
-  agent_id    TEXT         — "consolidation_agent", "habit_agent", etc.
-  name        TEXT         — "entity_nnm101", "project_facts", "user_profile", ...
-  scope       ENUM         — GLOBAL / ORG / PROJECT / USER
-  memory_type ENUM         — DATA_INSIGHT / USER_PROFILE / ...
-  project_id  INT          — set when scope=PROJECT
-  user_id     INT          — set when scope=USER
-  object      JSONB        — structured payload
-  content_text TEXT        — plain-text rendering for RAG / display
-  confidence  FLOAT        — 0–1, written by consolidation_agent
+  agent_id     TEXT        — "consolidation_agent", "habit_agent", etc.
+  name         TEXT        — "entity_nnm101", "project_facts", "user_profile", ...
+  scope        ENUM        — GLOBAL / ORG / PROJECT / USER
+  memory_type  ENUM        — DATA_INSIGHT / KEY_FACTS / LESSON_LEARNED / USER_PROFILE / BOOKKEEPING
+  project_id   INT         — set when scope=PROJECT
+  user_id      INT         — set when scope=USER
+  object       JSONB       — structured payload
+  content_text TEXT        — plain-text rendering for FTS
+  confidence   FLOAT       — 0–1, written by ConsolidationAgent
+  version      INT         — incremented on each upsert
 ```
