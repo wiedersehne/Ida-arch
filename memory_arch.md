@@ -270,9 +270,9 @@ Ida is a single agent running a five-node reasoning loop: **Understand → Plan 
 |---|:---:|:---:|:---:|:---:|:---:|
 | Soul + Agent.md | ✓ | ✓ | ✓ | ✓ | — |
 | CH + CS | ✓ | ✓ | ◌ | — | — |
-| User Profile | ✓ | — | — | — | — |
+| User Profile | ✓ | — | — | ✓ | — |
 | Project Memory | ↑ | — | ◌ | — | — |
-| Skill.md | — | — | ✓ | — | — |
+| Skill.md | — | ✓ | ✓ | — | — |
 
 **✓** inject (static, always in prompt) · **↑** retrieve top-K by entity at node start · **◌** on demand via tool · **—** not loaded · P also receives U's state output (intent, entities, known facts) — not listed as a memory source since it is produced within the workflow
 
@@ -298,10 +298,12 @@ flowchart TD
     ep -.->|tool| Ex
 
     up --> U
+    up --> Ev
 
     pm -.->|top-K| U
     pm -.->|tool| Ex
 
+    sk -.->|tool| P
     sk -.->|tool| Ex
 
     style soul fill:#dde,stroke:#99a
@@ -335,9 +337,9 @@ P needs CH and CS directly: the planner must read the raw conversation and estab
 
 **Soul + Agent.md in all reasoning nodes.** Small, stable, and essential for grounding every step. Omitting them causes behavioral drift.
 
-**User Profile in U only.** Preferences shape how the query is interpreted, not how tool calls are planned. By P, the intent is resolved; user style is irrelevant to scheduling.
+**User Profile in U and Ev.** In U it shapes how the query is interpreted. In Ev it grounds the evaluation: did the answer match this user's detail level, domain knowledge, and output preferences? Without it, Ev can only check factual correctness, not whether the response was right for this person.
 
-**Ex gets Skill.md on demand.** The right skill is unknown until the plan is formed. `tool_load_skill` fires at the start of Execute once the task type is clear.
+**Skill.md in P and Ex.** P needs the skill's approach and constraints to write a correct execution plan — scheduling tool calls without knowing the skill's required sequence produces an invalid plan. Ex uses it to guide step-by-step execution. Both nodes load it via `tool_load_skill` once the task type is resolved.
 
 **CH, CS, and PM optionally in Ex.** Most skills don't need them — U/P already provided the context. But a skill verifying a specific fact mid-execution, looking up a long-ago exchange, or retrieving memory for a newly identified entity can do so via tool without re-injecting the full payload.
 
@@ -403,11 +405,9 @@ Industry practice for structured entity stores (e.g., knowledge graphs, Weaviate
 - **Hard filter:** inject only `verified` entries into U and P as established facts; skip `inferred` and `conflicted` entirely (they remain available via `tool_read_cheatsheet` for skills that need them).
 - **Labeled injection:** include all entries but prefix conflicted entries with an explicit marker: `[CONFLICTED — two values reported: X, Y]`. This preserves the information while preventing silent misuse.
 
-**4. Evaluate is grounded only in Soul/Agent.md.**
+**4. Evaluate grounding — partially fixed.**
 
-Ev receives Soul.md + Agent.md plus the conversation history (Ex's output flows through). This is thin. In Reflexion (Shinn et al., 2023), CRITIC (Gou et al., 2023), and Self-RAG (Asai et al., 2023), the reflection/evaluation step explicitly receives: the original task, the evaluation criteria, and the generated output. Ev reasoning solely from persona and general agent instructions will produce shallow evaluation — it can check tone and format but not correctness, completeness, or whether the answer is grounded in tool results.
-
-Ev should also receive the original user query and an explicit quality rubric (e.g., "every numerical claim must cite a tool result"). This belongs in the Evaluate section of `AGENT.md`, not as additional memory injection per se — but it is a gap in the current design.
+User Profile is now injected into Ev, enabling persona-aware evaluation: did the answer match this user's detail level, domain knowledge, and output preferences? The remaining gap — explicit quality criteria (e.g., "every numerical claim must cite a tool result") — belongs in the Evaluate section of `AGENT.md` as a rubric, not as additional memory injection.
 
 ---
 
@@ -415,14 +415,14 @@ Ev should also receive the original user query and an explicit quality rubric (e
 
 | Decision | Assessment |
 |---|---|
-| Skill.md on demand | ✓ Correct — RAG-over-instructions pattern |
-| User Profile in U only | ✓ Correct |
+| Skill.md in P and Ex | ✓ Correct — planner needs skill constraints |
+| User Profile in U and Ev | ✓ Fixed — Ev now persona-aware |
 | Background agents, cursor-based | ✓ Correct |
 | Tool access for CH/CS/PM in Ex | ✓ Correct |
 | PM top-K retrieval in U, state to P | ✓ Fixed — entity-conditioned, not full-dump |
 | CH + CS in both U and P; PM via state | ~ Deliberate — CH/CS needed by planner; PM fixed |
 | Cheatsheet injected without confidence filter | ✗ Risk of conflicted entries misleading reasoning |
-| Ev grounded only in Soul/Agent.md | ✗ Insufficient — needs task + quality criteria |
+| Ev quality rubric | ✗ Still missing — belongs in Ev section of AGENT.md |
 
 ---
 
