@@ -266,48 +266,43 @@ Ida is a single agent running a five-node reasoning loop: **Understand → Plan 
 
 ### Injection map
 
-| Memory source | Type | U | P | Ex | Ev | A |
-|---|---|:---:|:---:|:---:|:---:|:---:|
-| Soul.md + Agent.md | Identity, task scope | ✓ | ✓ | ✓ | ✓ | — |
-| Recent Chat History | Session episodic | ✓ | ✓ | ◌ | — | — |
-| Cheatsheet | Session episodic | ✓ | ✓ | ◌ | — | — |
-| User Profile | USER agent_memory | ✓ | — | — | — | — |
-| Project Memory | PROJECT agent_memory | ✓ | ✓ | ◌ | — | — |
-| Skill.md | Per-task instructions | — | — | ✓ | — | — |
+| Memory source | U | P | Ex | Ev | A |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Soul + Agent.md | ✓ | ✓ | ✓ | ✓ | — |
+| CH + CS | ✓ | ✓ | ◌ | — | — |
+| User Profile | ✓ | — | — | — | — |
+| Project Memory | ↑ | — | ◌ | — | — |
+| Skill.md | — | — | ✓ | — | — |
 
-**✓** = always injected · **◌** = on demand via tool in Execute · **—** = not loaded
+**✓** inject (static, always in prompt) · **↑** retrieve top-K by entity at node start · **◌** on demand via tool · **—** not loaded
 
 ### Workflow diagram
 
 ```mermaid
 flowchart TD
-    soul(["Soul.md + Agent.md\nIdentity · task scope · reasoning principles"])
-    ep(["Recent Chat History  ·  Cheatsheet\nSession episodic memory"])
-    up(["User Profile\nUSER-scoped agent_memory"])
-    pm(["Project Memory\nPROJECT-scoped agent_memory"])
-    sk(["Skill.md\nPer-task instructions"])
+    soul(["Soul + Agent.md"])
+    ep(["CH · CS"])
+    up(["User Profile"])
+    pm(["Project Mem"])
+    sk(["Skill.md"])
 
-    U["🔍 Understand"] --> P["📐 Plan"]
-    P --> Ex["⚙️ Execute"]
-    Ex --> Ev["✅ Evaluate"]
-    Ev --> A["💬 Answer"]
+    U["U"] -->|state| P["P"] --> Ex["Ex"] --> Ev["Ev"] --> A["A"]
 
-    soul -->|inject| U
-    soul -->|inject| P
-    soul -->|inject| Ex
-    soul -->|inject| Ev
+    soul --> U
+    soul --> P
+    soul --> Ex
+    soul --> Ev
 
-    ep -->|inject| U
-    ep -->|inject| P
+    ep --> U
+    ep --> P
     ep -.->|tool| Ex
 
-    up -->|inject| U
+    up --> U
 
-    pm -->|inject| U
-    pm -->|inject| P
+    pm -.->|top-K| U
     pm -.->|tool| Ex
 
-    sk -.->|tool_load_skill| Ex
+    sk -.->|tool| Ex
 
     style soul fill:#dde,stroke:#99a
     style ep fill:#dfd,stroke:#9a9
@@ -316,38 +311,34 @@ flowchart TD
     style sk fill:#ffd,stroke:#aa9
 ```
 
-### Context load in U and P
-
-U and P carry the same sources (except User Profile, which is U-only). Rough token estimates for an active chat on a mature project:
+### Context load
 
 | Source | Typical size | U | P |
 |---|---|:---:|:---:|
-| Soul.md + Agent.md | ~2–3k | ✓ | ✓ |
-| Recent chat history (last 12 exchanges) | ~4–6k | ✓ | ✓ |
-| Cheatsheet | ~1–3k | ✓ | ✓ |
-| User profile | ~0.5–1k | ✓ | — |
-| Project memory | ~2–5k | ✓ | ✓ |
-| **Total** | **~10–18k** | | |
+| Soul + Agent.md | ~2–3k | ✓ | ✓ |
+| CH (last 12 exchanges) | ~4–6k | ✓ | ✓ |
+| CS | ~1–3k | ✓ | ✓ |
+| User Profile | ~0.5–1k | ✓ | — |
+| Project Memory | top-K only, ~1–2k | ↑ | via state |
+| **Total** | **~9–15k** | | |
 
-Both U and P therefore operate on 10–17k tokens of injected context. This is well within the 200k context limit and not a practical concern today. Two redundancy points worth watching as projects grow:
+P receives U's state output rather than a fresh PM injection — no additional tokens beyond what U already synthesized. This keeps P lean and avoids re-reading raw sources.
 
-**CH and Cheatsheet overlap.** The cheatsheet is a curated distillation of the full chat history. Injecting both means older exchanges are represented twice — once in raw form and once compressed. The mitigation is already implied in the design: inject only **recent** exchanges (last N), not the full transcript. The cheatsheet covers everything prior. These two sources are complementary, not duplicates, as long as "recent" is bounded.
-
-**Project memory unbounded growth.** A long-running project with many wells could accumulate substantial memory. If this becomes a constraint, the mitigation is to retrieve only the entries relevant to the current query (based on the entities in the current turn) rather than loading all project memory. This requires a lightweight retrieval step in U, which is a natural extension of the current design.
+**CH and CS overlap.** The cheatsheet is a curated distillation of older exchanges. They are complementary as long as CH is bounded to recent exchanges (last N) — CS covers history prior to the window. No redundancy if this bound is enforced.
 
 ### Why each node gets what it gets
 
-**U gets everything.** Understand is the synthesis step — its job is to read the full picture and produce a compact, grounded intent statement. Giving it less context risks misinterpretation.
+**U gets the full picture — including top-K project memory retrieval.** U's job is to synthesize: interpret the query, identify the relevant entities and wells, recall what is already known about them, and produce a structured state for the rest of the workflow. PM is retrieved by entity match at the start of U, not dumped wholesale. The retrieved entries travel forward in U's state output.
 
-**P gets CH, CS, and Project Memory.** The planner needs the full session picture (CH, CS) to avoid re-investigating what was already established this conversation, and cross-session context (project memory) to avoid repeating work from prior sessions. Both are needed to write a non-redundant execution plan.
+**P consumes U's state — no raw re-injection.** P receives Soul/Agent.md plus U's output (intent, entities, known facts including retrieved PM). It does not re-read CH, CS, or PM from source. Re-injecting the same raw sources at P is the context-stuffing anti-pattern: P reasons better over a compact, synthesized state than over 15k tokens of repeated context.
 
-**Soul.md + Agent.md in all reasoning nodes.** Small, stable, and essential for grounding every reasoning step. Omitting them causes drift.
+**Soul + Agent.md in all reasoning nodes.** Small, stable, and essential for grounding every step. Omitting them causes behavioral drift.
 
-**User Profile in U only.** Knowing how the user prefers to work shapes how Ida interprets an ambiguous question. By Plan, the intent is already clear; user preferences do not affect which tool calls to schedule.
+**User Profile in U only.** Preferences shape how the query is interpreted, not how tool calls are planned. By P, the intent is resolved; user style is irrelevant to scheduling.
 
-**Ex gets Skill.md on demand.** Ida doesn't know which skill applies until the plan is formed. `tool_load_skill` is called at the start of Execute once the task type is clear.
+**Ex gets Skill.md on demand.** The right skill is unknown until the plan is formed. `tool_load_skill` fires at the start of Execute once the task type is clear.
 
-**CH, CS, and Project Memory optionally in Ex.** Most skills won't need them — the plan is already formed and the injected context in U/P was sufficient. But a skill that needs to verify a specific fact mid-execution, retrieve a long-ago exchange, or pull project-memory entries for a newly identified entity can do so via tool without re-injecting the full payload into every execution prompt.
+**CH, CS, and PM optionally in Ex.** Most skills don't need them — U/P already provided the context. But a skill verifying a specific fact mid-execution, looking up a long-ago exchange, or retrieving memory for a newly identified entity can do so via tool without re-injecting the full payload.
 
 ### Tools for CH, CS, and Project Memory access in Execute
 
@@ -369,10 +360,72 @@ Three tools support on-demand context loading in Execute:
 | Chat History | Framework (`load_message_history`) | Loaded in U ✓ |
 | Cheatsheet | CheatsheetAgent ✓ | **Not yet injected in U** |
 | User Profile | HabitAgent ✓ | **Not yet read** |
-| Project Memory | ConsolidationAgent ✓ | **Not yet injected in U/P** |
+| Project Memory | ConsolidationAgent ✓ | **Not yet retrieved in U** (entity-match top-K) |
 | Skill.md | Manual (checked in) | Loaded on demand in Ex ✓ |
 
 The write infrastructure is complete. The remaining work is activation: inject cheatsheet, user profile, and project memory into the U/P prompts in `AGENT.md`.
+
+---
+
+### Industry practice review
+
+#### What aligns well
+
+**Skill.md on demand (RAG-over-instructions).** Dynamically loading task instructions based on the resolved intent is the correct pattern, used in production by OpenAI function schemas, LangChain tool descriptions, and retrieval-augmented instruction systems. Loading Skill.md upfront at every node would be expensive and brittle.
+
+**User Profile in U only.** Consistent with how personalization is handled in production assistants. Preferences shape interpretation, not planning logic. Injecting them beyond U adds tokens without value.
+
+**Background agents for memory maintenance.** Running CheatsheetAgent, ConsolidationAgent, and HabitAgent asynchronously — never blocking a user request — is the standard production pattern. Synchronous memory maintenance during inference is an anti-pattern because it adds latency to the critical path.
+
+**Cursor-based incremental processing.** Correct. Timestamp cursors are the industry-standard mechanism for durable, resumable streaming pipelines (used in Kafka consumers, CDC systems, and production agent memory backends like Zep).
+
+**Tool-based access for CH, CS, PM in Execute.** The on-demand retrieval pattern for archival memory is well-established (MemGPT's archival memory, OpenAI's file search). Making tools the access path — rather than always-injecting — is correct for content that is large, selective, and query-specific.
+
+---
+
+#### Concerns
+
+**1. Project memory full-dump — fixed.**
+
+~~The current design injects all project memory into U and P unconditionally.~~ **Resolved:** PM is retrieved by entity match at the start of U (top-K, not full-dump). The retrieved entries travel forward in U's state output to P; P has no direct PM injection. For IDA's current scale, entity-based filtering (by well name extracted from the query) is sufficient. Semantic embedding search over `content_text` is the natural next step when entity matching is insufficient.
+
+**2. Re-injecting the same raw sources at both U and P.**
+
+U and P both receive CH, CS, and project memory. This is the "context stuffing" anti-pattern. In LangGraph, LangChain Expression Language, and ReAct-style frameworks, nodes pass structured state forward — U produces an intent object (interpreted query, relevant entities, known facts) and P consumes that object. P does not re-read the raw sources; it reasons over U's output.
+
+Re-injection has two costs. First, token cost: the same 10–17k tokens are paid twice per user turn. Second, reasoning cost: an LLM presented with the same content in two places (the raw CH and U's synthesis of it) can attend to either, which reduces the reliability of the synthesis step. If U's output is well-structured, P should not need raw CH or CS — it has everything U extracted.
+
+The fix: define a structured `ReasoningState` that U populates (intent, entities, what is already known, what still needs investigation) and P consumes. P only needs Soul/Agent.md, project memory (for planning around cross-session knowledge), and the ReasoningState. Raw CH and CS drop out of P.
+
+**3. Cheatsheet is injected without confidence filtering.**
+
+The cheatsheet has three confidence levels: `verified`, `inferred`, and `conflicted`. The injection design injects all of them. Presenting `conflicted` entries — two contradictory values for the same metric — to a reasoning node as flat context is unreliable: the model may pick one value arbitrarily without recognizing the conflict.
+
+Industry practice for structured entity stores (e.g., knowledge graphs, Weaviate filtered retrieval) is to filter or label by confidence at read time. Two options:
+
+- **Hard filter:** inject only `verified` entries into U and P as established facts; skip `inferred` and `conflicted` entirely (they remain available via `tool_read_cheatsheet` for skills that need them).
+- **Labeled injection:** include all entries but prefix conflicted entries with an explicit marker: `[CONFLICTED — two values reported: X, Y]`. This preserves the information while preventing silent misuse.
+
+**4. Evaluate is grounded only in Soul/Agent.md.**
+
+Ev receives Soul.md + Agent.md plus the conversation history (Ex's output flows through). This is thin. In Reflexion (Shinn et al., 2023), CRITIC (Gou et al., 2023), and Self-RAG (Asai et al., 2023), the reflection/evaluation step explicitly receives: the original task, the evaluation criteria, and the generated output. Ev reasoning solely from persona and general agent instructions will produce shallow evaluation — it can check tone and format but not correctness, completeness, or whether the answer is grounded in tool results.
+
+Ev should also receive the original user query and an explicit quality rubric (e.g., "every numerical claim must cite a tool result"). This belongs in the Evaluate section of `AGENT.md`, not as additional memory injection per se — but it is a gap in the current design.
+
+---
+
+#### Summary
+
+| Decision | Assessment |
+|---|---|
+| Skill.md on demand | ✓ Correct — RAG-over-instructions pattern |
+| User Profile in U only | ✓ Correct |
+| Background agents, cursor-based | ✓ Correct |
+| Tool access for CH/CS/PM in Ex | ✓ Correct |
+| PM top-K retrieval in U, state to P | ✓ Fixed — entity-conditioned, not full-dump |
+| Re-injecting CH + CS in P | ✗ Context stuffing — P should consume U's state output |
+| Cheatsheet injected without confidence filter | ✗ Risk of conflicted entries misleading reasoning |
+| Ev grounded only in Soul/Agent.md | ✗ Insufficient — needs task + quality criteria |
 
 ---
 
