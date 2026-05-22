@@ -295,22 +295,28 @@ Habit promotion path deferred to Task 3.1. Overflow trigger deferred to Task 4.1
 
 ---
 
-## May 25–30: New Tools + MemoryService (Steps 1–4)
+## May 25–30: Tools Upgrade + MemoryService + Habit Promotion
 
-**Goal:** Implement the three new tools that support on-demand context access. Build
-MemoryService to assemble per-node prompt context. Steps 1–3 are independent and can
-be done in parallel; Step 4 depends on them.
+**Goal:** Upgrade the two existing tools with filtering/retrieval extensions. Implement
+`tool_read_chat_history` (new). Build `MemoryService`. Add habit promotion path to
+`ConsolidationAgent`. Steps 3.1–3.3 are independent and can be done in parallel; 3.4
+depends on them. 3.5 (habit promotion) is independent — extending existing ConsolidationAgent code.
+
+Note: `tool_read_cheatsheet` and `tool_read_memory` already exist with basic functionality.
+These tasks are upgrades, not rewrites.
 
 ---
 
-### Task 3.1 — `tool_read_cheatsheet` (Step 1)
+### Task 3.1 — Upgrade `tool_read_cheatsheet` with filtering (Step 1)
 
 **File:** `backend/app/agents/tools/toolbox/mem_storage_toolbox.py`
 
-The existing `tool_read_memory` reads from `agent_memory` (cross-session). It does not
-touch `chat.cheatsheet` (per-chat). A dedicated tool is needed for Execute-node access.
+`tool_read_cheatsheet` already exists and reads the raw `chat.cheatsheet` string. It
+does not parse structured JSON or support filtering. The upgrade adds `confidence` and
+`well` filter params so Execute can ask for exactly what it needs without receiving
+the full blob.
 
-**Args schema:**
+**Add to args schema:**
 ```python
 {
   "confidence": {
@@ -326,9 +332,10 @@ touch `chat.cheatsheet` (per-chat). A dedicated tool is needed for Execute-node 
 # passthrough_params: chat_id, project_id, session_id, trace_id
 ```
 
-**Implementation:** `project_service.get_chat_cheatsheet(chat_id)` → `parse_cheatsheet()`
-→ filter by `confidence` and `_normalize_entity_key(well)` → return markdown grouped by
-bucket (`data_insights`, `key_facts`, `lessons_learned`).
+**Implementation:** parse raw cheatsheet with `parse_cheatsheet()`, filter by `confidence`
+and `_normalize_entity_key(well)`, return markdown grouped by bucket (`data_insights`,
+`key_facts`, `lessons_learned`). Unfiltered call (no args) still returns all entries —
+existing callers unaffected.
 
 **Primary use in Execute:** verify a known fact before running an expensive retrieval tool.
 `tool_read_cheatsheet(confidence="verified", well="NNM-101")` — if complete, skip the
@@ -373,7 +380,7 @@ the injected window — e.g. a report skill referencing an exchange from 20 turn
 
 ---
 
-### Task 3.3 — Extend `tool_read_memory` for top-K retrieval (Step 3)
+### Task 3.3 — Upgrade `tool_read_memory` for top-K retrieval (Step 3)
 
 **File:** `backend/app/agents/tools/toolbox/mem_storage_toolbox.py` (existing tool)
 
@@ -474,24 +481,45 @@ Mock `project_service` and `agent_memory_service`; assert system/context/state f
 
 ---
 
+### Task 3.5 — ConsolidationAgent: habit promotion path (EX-2 phase 2)
+
+**File:** `backend/app/agents/workers/consolidation_agent.py`
+
+ConsolidationAgent already promotes `data_insights`, `key_facts`, and `lessons_learned`
+from the cheatsheet into PROJECT-scoped `agent_memory`. The habit promotion path —
+reading `chat.habit` and writing to USER-scoped `agent_memory` — is not yet implemented.
+This is an extension of the existing agent, not a new agent.
+
+**Add to `_run()` loop:**
+1. Query chats where `chat.habit IS NOT NULL` and `habit_cursor_ts > last_habit_promoted_ts`.
+   Cursor stored in GLOBAL `agent_memory`, key `habit_consolidation_cursor`
+2. Feed existing USER profile (`agent_memory` USER scope, name=`user_profile`) + new per-chat
+   `chat.habit` entries to LLM
+3. LLM merges: confirms patterns seen across multiple chats, softens contradictions, adds new observations
+4. Write merged profile to `agent_memory` USER scope, `memory_type=USER_PROFILE`
+5. Advance `habit_consolidation_cursor` in GLOBAL `agent_memory`
+
+---
+
 ### Validation (May 25–30)
 
-- Call each new tool from a test script; verify output format and filtering
-- `tool_read_cheatsheet(confidence="verified", well="NNM-101")` returns only matching entries
+- `tool_read_cheatsheet(confidence="verified", well="NNM-101")` returns only matching entries; unfiltered call still returns all
+- `tool_read_chat_history(n=5)` returns the 5 most recent user+agent pairs as a transcript
 - `tool_read_memory(query="NNM-101")` returns the correct `entity_nnm101` entry
 - Instantiate `MemoryService`; call `bundle_for_node` for each node; assert system/context/state fields are non-empty and contain the expected sections
+- Trigger ConsolidationAgent on a chat with `chat.habit` set; verify USER-scoped `agent_memory` written
 
 ---
 
-## Jun 1–6: Wire into Ida + Confidence Fix + Ev Rubric (Step 5)
+## Jun 1–6: Wire into Ida + Confidence Fix + Ev Rubric + Live Sessions (Step 5)
 
 **Goal:** Wire MemoryService into the running Ida agent behind a feature flag. Fix
-cheatsheet confidence filtering at injection. Add Ev quality rubric. Complete habit
-promotion path in ConsolidationAgent.
+cheatsheet confidence filtering. Add Ev quality rubric. Run first live session tests
+with the full injection pipeline active.
 
 ---
 
-### Task 3.5 — Wire MemoryService into Ida (Step 5)
+### Task 3.6 — Wire MemoryService into Ida (Step 5)
 
 **Files:** Ida agent Python entry point, `backend/app/agents/skills/ida_agent/AGENT.md`
 
@@ -499,7 +527,7 @@ promotion path in ConsolidationAgent.
 1. Instantiate `MemoryService` at request entry, passing `chat_id`, `project_id`, `user_id`
 2. Replace manual prompt construction at each node with `bundle_for_node(node, ...)`
 3. Pass `u_state` from U → P, `p_state` from P → Ex, `ex_state` from Ex → Ev
-4. Register `tool_read_cheatsheet` and `tool_read_chat_history` in `register_tools()`
+4. `tool_read_chat_history` is new — register it in `register_tools()`
 
 **AGENT.md changes:**
 - Understand section: what context U receives; what structured state it must emit
@@ -507,20 +535,20 @@ promotion path in ConsolidationAgent.
 - Plan section: what context P receives; that it must produce an ordered execution plan
 - Execute section: tools available for on-demand access (`tool_read_cheatsheet`,
   `tool_read_chat_history`, `tool_read_memory`)
-- Evaluate section: quality rubric (see Task 3.6) and what persona context is available
+- Evaluate section: quality rubric (see Task 3.7) and what persona context is available
 
 **Risk:** changes prompt construction for every node. Use feature flag
 `IDA_MEMORY_SERVICE=true` until validated on at least two live sessions.
 
 ---
 
-### Task 3.6 — Cheatsheet confidence filtering at injection
+### Task 3.7 — Cheatsheet confidence filtering at injection
 
 **File:** `backend/app/services/memory/memory_service.py`
 
-The cheatsheet is currently injected without filtering. `conflicted` entries — two
-contradictory values for the same metric — can mislead a reasoning node that picks one
-value without recognising the conflict.
+The cheatsheet is injected without filtering. `conflicted` entries — two contradictory
+values for the same metric — can mislead a reasoning node that picks one value without
+recognising the conflict.
 
 **Change in `load_cheatsheet()`:** inject `verified` and `inferred` entries as-is;
 prefix `conflicted` entries with an explicit marker:
@@ -534,7 +562,7 @@ explicitly needs conflict data.
 
 ---
 
-### Task 3.7 — Evaluate quality rubric in AGENT.md
+### Task 3.8 — Evaluate quality rubric in AGENT.md
 
 **File:** `backend/app/agents/skills/ida_agent/AGENT.md`
 
@@ -550,20 +578,6 @@ quality criteria — without them Ev can only check factual surface correctness.
 
 ---
 
-### Task 3.8 — ConsolidationAgent: habit promotion path (EX-2 phase 2)
-
-**File:** `backend/app/agents/workers/consolidation_agent.py`
-
-**Habit promotion (USER scope):**
-1. Query chats where `chat.habit IS NOT NULL` and `chat.habit_cursor_ts > last_habit_promoted_ts`.
-   Cursor stored in GLOBAL `agent_memory`, key `habit_consolidation_cursor`
-2. Feed existing USER profile (`agent_memory` USER scope) + new per-chat `chat.habit` entries to LLM
-3. LLM merges: confirms patterns seen across multiple chats, softens contradictions, adds new observations
-4. Write merged profile to `agent_memory` USER scope, `memory_type=USER_PROFILE`
-5. Advance `habit_consolidation_cursor` in GLOBAL `agent_memory`
-
----
-
 ### Validation (Jun 1–6)
 
 - Enable `IDA_MEMORY_SERVICE=true`; run two live sessions on a known well
@@ -571,6 +585,8 @@ quality criteria — without them Ev can only check factual surface correctness.
 - Verify PM retrieval at U returns correct `entity_*` entries for queried wells
 - Verify `conflicted` entries appear with `[CONFLICTED — ...]` prefix in injected context
 - Verify U's state output contains `entities` matching well names mentioned in the query
+- After a session goes idle: verify USER-scoped `agent_memory` (`user_profile`) written by
+  ConsolidationAgent from `chat.habit` data
 
 ---
 
@@ -661,7 +677,7 @@ deduplicates. Overflow only occurs in unusually long sessions or degraded dedupl
 | Curator JSON output is malformed | Parse error, entries lost | Validate output; fallback to plain-text append on parse failure; log all failures |
 | ConsolidationAgent over-promotes wrong facts | Wrong facts persist in PROJECT memory across sessions | Conservative mode: only `verified` entries auto-promoted in Q2; `inferred` logged for review |
 | Step 5 breaks prompt construction | All nodes degraded | Feature flag `IDA_MEMORY_SERVICE`; validate on non-prod chat first |
-| Conflicted cheatsheet entries mislead U | Wrong facts retrieved at session start | Task 3.6: prefix `[CONFLICTED]` at injection time; Ev rubric catches silent picks |
+| Conflicted cheatsheet entries mislead U | Wrong facts retrieved at session start | Task 3.7: prefix `[CONFLICTED]` at injection time; Ev rubric catches silent picks |
 | Soak reveals systematic curator errors | Prompt debugging consumes tuning time | Prompt iteration is fast (no Python changes); 2-day round-trip per fix |
 | Not enough real sessions to fully validate ConsolidationAgent by end of June | EP-2 and `inferred` auto-promotion slip to Q3 | Expected — soak is the plan, not a risk. Q2 success = first session correctly recalled, not full pipeline validated |
 | SQLModel enum bug blocks memory_type writes | ConsolidationAgent writes silently fail | Task 2.2 fix; validate before soak begins |
