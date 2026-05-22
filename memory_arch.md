@@ -22,6 +22,7 @@ Three idle thresholds define the memory lifecycle for a session:
 ```
 Active session
   └─ exchanges scroll out of TAIL_WINDOW (12) → curated immediately
+  └─ every 3h of cursor gap → ConsolidationAgent fires mid-session (see below)
 
 t=0       user stops
 t=40 min  IDLE_BYPASS_THRESHOLD → CheatsheetAgent flushes tail records
@@ -30,6 +31,19 @@ t=60 min  HabitAgent → extracts user habits → USER memory
 ```
 
 The 20-minute gap between cheatsheet flush (40 min) and consolidation (60 min) is intentional: consolidation reads the cheatsheet, so the cheatsheet must be fully settled first.
+
+### Long active sessions
+
+ConsolidationAgent normally requires a 60-minute idle gap to fire. For sessions that run continuously without a long break, this would leave all findings in the cheatsheet with no promotion to PROJECT memory until the session ends.
+
+To handle this, ConsolidationAgent also fires when the gap between `cheatsheet_cursor_ts` and `consolidation_cursor_ts` exceeds **3 hours**, regardless of session activity:
+
+```
+FIRE when:  cheatsheet_cursor > consolidation_cursor
+            AND (idle > 60 min  OR  cursor_gap > 3 hours)
+```
+
+A full 8-hour working session therefore triggers mid-session consolidation at least twice. Because ConsolidationAgent advances `consolidation_cursor_ts` after each run, subsequent runs only process new entries — no duplication. Only `verified` entries are promoted, which are tool-result-backed and stable enough to consolidate mid-session.
 
 ---
 
@@ -121,7 +135,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([poll every 300s]) --> B[get_chats_needing_consolidation\nidle > 60 min\ncheatsheet_cursor > consolidation_cursor]
+    A([poll every 300s]) --> B[get_chats_needing_consolidation\ncheatsheet_cursor > consolidation_cursor\nAND idle > 60 min OR cursor_gap > 3h]
     B --> C{any chats?}
     C -- No --> A
     C -- Yes --> D[for each chat]
@@ -224,29 +238,130 @@ Each curator LLM call takes ~15s. During fast interactions (15–20s between exc
 
 **Current mitigation:** none. The gap closes at idle flush (40 min).
 
-### 3. ConsolidationAgent only runs at session end
-
-If a session is very long and active (no 60-minute idle gap), ConsolidationAgent never fires during that session. In a full working day of continuous use, all findings stay in the cheatsheet and never reach PROJECT memory until the user stops for an hour.
-
-### 4. Simple dedup fallback is not semantic
+### 3. Simple dedup fallback is not semantic
 
 When the LLM is unavailable, `_dedupe` falls back to case-insensitive string equality. "NPT: 54.2 hrs" and "NPT was 54 hours" are treated as different facts and both promoted. The LLM synthesis prompt handles this correctly; the fallback does not.
 
-### 5. No memory staleness or conflict resolution across chats
+### 4. No memory staleness or conflict resolution across chats
 
 If chat A reports NPT = 54h and chat B reports NPT = 71h for the same well, both get promoted to `entity_nnm101.insights` as separate strings (via `_dedupe`). The cheatsheet handles intra-session conflicts with the `conflicted` confidence level, but ConsolidationAgent has no equivalent mechanism across sessions. The LLM synthesis prompt is supposed to detect this ("values vary: X, Y"), but it is not guaranteed.
 
-### 6. Well key normalisation is lossy
+### 5. Well key normalisation is lossy
 
 `_normalize_entity_key("NNM-101")` → `"nnm101"`. This collapses NNM-101 and NNM101 into the same key, which is intentional. But it also collapses hypothetical wells like NNM-10 and NNM-1-0 (if they existed). The normalisation is simple and works for the current well naming convention, but is not robust to arbitrary naming schemes.
 
-### 7. Hardcoded DB credentials in the live test
+### 6. Hardcoded DB credentials in the live test
 
 `test_cheatsheet_live.py` contains `postgresql://ida:ida1793@localhost:5432/ida`. This is fine for local dev but must not be used as-is in any shared or CI environment.
 
-### 8. HabitAgent fires at the same threshold as ConsolidationAgent (60 min)
+### 7. HabitAgent fires at the same threshold as ConsolidationAgent (60 min)
 
 Both agents fire at 60-minute idle. In practice this means both run simultaneously after a session ends. HabitAgent reads the full transcript; ConsolidationAgent reads the cheatsheet. There is no coordination — they run independently and write to different tables, which is fine. But the ordering is not guaranteed: HabitAgent could write a user profile before ConsolidationAgent has finished merging facts from the same session. This is harmless today but worth noting if ordering ever matters.
+
+---
+
+## Memory Injection into the Agent Workflow
+
+IDA's agent runs as a five-node reasoning loop: **Understand → Plan → Execute → Evaluate → Answer**. Each node receives a subset of available memory — injected statically into the prompt, or loaded dynamically via tool call during execution. The injection pattern determines what Ida knows when, and therefore how well she reasons at each step.
+
+### Injection map
+
+| Memory source | Type | U | P | Ex | Ev | A |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| Soul.md + Agent.md | Identity, task scope | ✓ | ✓ | ✓ | ✓ | — |
+| Chat History | Session episodic | ✓ | ✓ | ◌ | — | — |
+| Cheatsheet | Session episodic | ✓ | ✓ | ◌ | — | — |
+| User Profile | USER agent_memory | ✓ | ✓ | — | — | — |
+| Project Memory | PROJECT agent_memory | — | — | ✓ | — | — |
+| Skill.md | Per-task instructions | — | — | ✓ | — | — |
+
+**✓** = always injected into the system prompt · **◌** = on demand via tool (`tool_read_cheatsheet`, `tool_read_chat_history`) · **—** = not loaded at this node
+
+### Workflow diagram
+
+```mermaid
+flowchart TD
+    soul(["Soul.md + Agent.md\nIdentity · task scope · reasoning principles"])
+    ep(["Chat History  ·  Cheatsheet\nSession episodic memory"])
+    up(["User Profile\nUSER-scoped agent_memory"])
+    pm(["Project Memory\nPROJECT-scoped agent_memory"])
+    sk(["Skill.md\nPer-task instructions"])
+
+    U["🔍 Understand"] --> P["📐 Plan"] --> Ex["⚙️ Execute"] --> Ev["✅ Evaluate"] --> A["💬 Answer"]
+
+    soul -->|inject| U
+    soul -->|inject| P
+    soul -->|inject| Ex
+    soul -->|inject| Ev
+
+    ep -->|inject| U
+    ep -->|inject| P
+    ep -.->|flexible| Ex
+
+    up -->|inject| U
+    up -->|inject| P
+
+    pm -.->|tool_read_memory| Ex
+    sk -.->|tool_load_skill| Ex
+
+    style soul fill:#dde,stroke:#99a
+    style ep fill:#dfd,stroke:#9a9
+    style up fill:#dfd,stroke:#9a9
+    style pm fill:#ffd,stroke:#aa9
+    style sk fill:#ffd,stroke:#aa9
+```
+
+### Why this split makes sense
+
+**Soul.md + Agent.md in all reasoning nodes.** Every step needs to stay grounded in who Ida is, what she's allowed to claim, and what the agent is responsible for. These files are small and stable — the cost of repeating them is low, the cost of omitting them is reasoning drift.
+
+**Chat History + Cheatsheet in Understand and Plan.** To interpret the current turn, Ida needs conversation context (chat history). To avoid re-investigating what is already known, she needs the cheatsheet. Both are session-scoped and modest in size relative to the context window. In Execute, individual tools can fetch specific records via `tool_get_record_data` when needed — injecting the full history into every tool call would be redundant and expensive.
+
+**User Profile in Understand and Plan.** Knowing how the user prefers to receive answers shapes how Ida interprets an ambiguous question (U) and how she plans the response format and detail level (P). By Execute, the tools run mechanically and user-style preferences are irrelevant.
+
+**Project Memory via tool in Execute.** Project memory can be large and is query-specific — which wells are relevant depends on what the execution plan has resolved. Loading it via `tool_read_memory` during Execute allows selective retrieval instead of dumping everything into every prompt. It also keeps memory out of the planner until it's actually needed.
+
+**Skill.md on demand in Execute.** The sub-agent doesn't know which skill applies until it has received the orchestrator's routing decision. Loading it on demand via `tool_load_skill` is the current design and works correctly.
+
+### Tools for flexible CH and CS access in Execute
+
+Marking Chat History and Cheatsheet as "optional" in Execute is only meaningful if there is a mechanism for a skill to request them mid-execution. Without tools, "flexible" has no implementation path.
+
+Two tools are needed:
+
+**`tool_read_cheatsheet`** — reads `chat.cheatsheet` for the current chat, optionally filtered by confidence level or well name. The primary use case is a skill checking whether a fact is already verified before running an expensive retrieval tool. Example: before querying the DDR for NPT on NNM-101, the skill calls `tool_read_cheatsheet(confidence="verified", well="NNM-101")` and skips the retrieval if the data is already there.
+
+**`tool_read_chat_history`** — reads N raw message exchanges from `chat_record`, with optional `oldest_first` and `before_record_id` parameters. Needed when a skill requires context beyond the exchanges injected in U/P — for example, a report skill referencing something from 20 exchanges back, or a reconciliation skill comparing the current answer against a much earlier one.
+
+Neither existing tool covers this:
+- `tool_read_playbook` reads session findings written by agents, but is free-text and manually maintained — not the structured, confidence-tagged cheatsheet
+- `tool_read_memory` reads from `agent_memory` (PROJECT/USER scope, cross-session) — not the per-chat cheatsheet
+- `tool_list_chat_data_records` / `tool_get_record_data` access staged analysis results, not raw message text
+
+Both tools are thin wrappers over existing DB queries (`get_chat_cheatsheet`, `get_chat_records`) and belong in `mem_storage_toolbox.py`. The skill's SKILL.md `Approach` section specifies when each is called — most skills will not call them at all.
+
+### Design gap: planner is blind to cross-session findings
+
+Project Memory is only loaded in Execute. This means the Plan phase has no visibility into what was confirmed in previous sessions — the planner could schedule tool calls to retrieve NPT data for NNM-101 even if that was fully resolved two sessions ago.
+
+**Short-term mitigation:** ConsolidationAgent writes compact `content_text` fields alongside each memory object. A lightweight memory summary (top-N content_text strings, truncated) injected into Plan would let the planner skip redundant investigation without loading the full memory payload.
+
+**Longer-term:** A dedicated memory-recall step before Plan — reading relevant project memories based on the understood intent — would close this gap cleanly. This is the same pattern used in retrieval-augmented planning.
+
+### Current vs target state
+
+The diagram above describes the **target design**. As of this writing:
+
+| Memory source | Write path | Read path |
+|---|---|---|
+| Soul.md + Agent.md | Manual (checked in) | Injected in current prompts ✓ |
+| Chat History | Framework (`load_message_history`) | Loaded in U ✓ |
+| Cheatsheet | CheatsheetAgent ✓ | **Not yet injected in U/P** |
+| User Profile | HabitAgent ✓ | **Not yet read by any sub-agent** |
+| Project Memory | ConsolidationAgent ✓ | **Not yet read by any sub-agent** |
+| Skill.md | Manual (checked in) | Loaded on demand in Ex ✓ |
+
+The infrastructure to write all memory types is complete. The activation — injecting cheatsheet + user profile into U/P, and wiring `tool_read_memory` calls into sub-agent AGENT.md files — is the remaining work.
 
 ---
 
