@@ -519,7 +519,7 @@ with the full injection pipeline active.
 
 ---
 
-### Task 3.6 — Wire MemoryService into Ida (Step 5)
+### Task 4.1 — Wire MemoryService into Ida (Step 5)
 
 **Files:** Ida agent Python entry point, `backend/app/agents/skills/ida_agent/AGENT.md`
 
@@ -535,14 +535,14 @@ with the full injection pipeline active.
 - Plan section: what context P receives; that it must produce an ordered execution plan
 - Execute section: tools available for on-demand access (`tool_read_cheatsheet`,
   `tool_read_chat_history`, `tool_read_memory`)
-- Evaluate section: quality rubric (see Task 3.7) and what persona context is available
+- Evaluate section: quality rubric (see Task 4.3) and what persona context is available
 
 **Risk:** changes prompt construction for every node. Use feature flag
 `IDA_MEMORY_SERVICE=true` until validated on at least two live sessions.
 
 ---
 
-### Task 3.7 — Cheatsheet confidence filtering at injection
+### Task 4.2 — Cheatsheet confidence filtering at injection
 
 **File:** `backend/app/services/memory/memory_service.py`
 
@@ -562,7 +562,7 @@ explicitly needs conflict data.
 
 ---
 
-### Task 3.8 — Evaluate quality rubric in AGENT.md
+### Task 4.3 — Evaluate quality rubric in AGENT.md
 
 **File:** `backend/app/agents/skills/ida_agent/AGENT.md`
 
@@ -597,7 +597,7 @@ Tune promotion thresholds and curator prompt.
 
 ---
 
-### Task 4.1 — EP-5: Context overflow detection + mid-session ConsolidationAgent trigger
+### Task 5.1 — EP-5: Context overflow detection + mid-session ConsolidationAgent trigger
 
 **Files:** `backend/app/agents/skills/ida_agent/AGENT.md`,
 `backend/app/agents/workers/consolidation_agent.py`
@@ -639,7 +639,7 @@ ConsolidationAgent gains a second trigger mode: `overflow`. Policy differs from 
 
 ---
 
-### Task 4.2 — Cheatsheet size cap *(implement only if soak reveals overflow)*
+### Task 5.2 — Cheatsheet size cap *(implement only if soak reveals overflow)*
 
 **Files:** `backend/app/services/cheatsheet/cheatsheet_service.py`,
 `backend/app/services/cheatsheet/cheatsheet_curator_prompt.py`
@@ -677,7 +677,7 @@ deduplicates. Overflow only occurs in unusually long sessions or degraded dedupl
 | Curator JSON output is malformed | Parse error, entries lost | Validate output; fallback to plain-text append on parse failure; log all failures |
 | ConsolidationAgent over-promotes wrong facts | Wrong facts persist in PROJECT memory across sessions | Conservative mode: only `verified` entries auto-promoted in Q2; `inferred` logged for review |
 | Step 5 breaks prompt construction | All nodes degraded | Feature flag `IDA_MEMORY_SERVICE`; validate on non-prod chat first |
-| Conflicted cheatsheet entries mislead U | Wrong facts retrieved at session start | Task 3.7: prefix `[CONFLICTED]` at injection time; Ev rubric catches silent picks |
+| Conflicted cheatsheet entries mislead U | Wrong facts retrieved at session start | Task 4.2: prefix `[CONFLICTED]` at injection time; Ev rubric catches silent picks |
 | Soak reveals systematic curator errors | Prompt debugging consumes tuning time | Prompt iteration is fast (no Python changes); 2-day round-trip per fix |
 | Not enough real sessions to fully validate ConsolidationAgent by end of June | EP-2 and `inferred` auto-promotion slip to Q3 | Expected — soak is the plan, not a risk. Q2 success = first session correctly recalled, not full pipeline validated |
 | SQLModel enum bug blocks memory_type writes | ConsolidationAgent writes silently fail | Task 2.2 fix; validate before soak begins |
