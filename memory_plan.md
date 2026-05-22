@@ -295,11 +295,11 @@ Habit promotion path deferred to Task 3.1. Overflow trigger deferred to Task 4.1
 
 ---
 
-## May 25–Jun 6: Memory Injection Pipeline
+## May 25–30: New Tools + MemoryService (Steps 1–4)
 
 **Goal:** Implement the three new tools that support on-demand context access. Build
-MemoryService to assemble per-node prompt context. Wire into Ida behind a feature flag.
-Fix cheatsheet confidence filtering at injection. Add Ev quality rubric.
+MemoryService to assemble per-node prompt context. Steps 1–3 are independent and can
+be done in parallel; Step 4 depends on them.
 
 ---
 
@@ -474,6 +474,23 @@ Mock `project_service` and `agent_memory_service`; assert system/context/state f
 
 ---
 
+### Validation (May 25–30)
+
+- Call each new tool from a test script; verify output format and filtering
+- `tool_read_cheatsheet(confidence="verified", well="NNM-101")` returns only matching entries
+- `tool_read_memory(query="NNM-101")` returns the correct `entity_nnm101` entry
+- Instantiate `MemoryService`; call `bundle_for_node` for each node; assert system/context/state fields are non-empty and contain the expected sections
+
+---
+
+## Jun 1–6: Wire into Ida + Confidence Fix + Ev Rubric (Step 5)
+
+**Goal:** Wire MemoryService into the running Ida agent behind a feature flag. Fix
+cheatsheet confidence filtering at injection. Add Ev quality rubric. Complete habit
+promotion path in ConsolidationAgent.
+
+---
+
 ### Task 3.5 — Wire MemoryService into Ida (Step 5)
 
 **Files:** Ida agent Python entry point, `backend/app/agents/skills/ida_agent/AGENT.md`
@@ -547,14 +564,13 @@ quality criteria — without them Ev can only check factual surface correctness.
 
 ---
 
-### Validation (May 25–Jun 6)
+### Validation (Jun 1–6)
 
-- Call each new tool from a test script; verify output format and filtering
-- Instantiate `MemoryService`; call `bundle_for_node` for each node; assert fields
 - Enable `IDA_MEMORY_SERVICE=true`; run two live sessions on a known well
 - Inspect prompt at each node: Soul+CH+CS at U; CH+CS+Skill at P; User Profile at Ev
 - Verify PM retrieval at U returns correct `entity_*` entries for queried wells
 - Verify `conflicted` entries appear with `[CONFLICTED — ...]` prefix in injected context
+- Verify U's state output contains `entities` matching well names mentioned in the query
 
 ---
 
