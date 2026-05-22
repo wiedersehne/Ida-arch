@@ -426,6 +426,225 @@ User Profile is now injected into Ev, enabling persona-aware evaluation: did the
 
 ---
 
+## Implementation Plan
+
+Two parallel tracks: (1) the tools the LLM calls mid-execution to pull additional context; (2) the `MemoryService` that assembles the initial prompt context before each LLM call. These are complementary — the service handles static injection and top-K retrieval at node entry; the tools handle on-demand access during execution.
+
+```
+Before LLM call        During LLM execution
+─────────────────      ──────────────────────
+MemoryService          tool_read_chat_history
+ └─ bundle_for_node     tool_read_cheatsheet
+     CH, CS, Profile    tool_read_memory (top-K)
+     Soul, Agent.md
+     Skill.md
+     PM (top-K)
+```
+
+---
+
+### Step 1 — `tool_read_cheatsheet`
+
+**File:** `app/agents/tools/toolbox/mem_storage_toolbox.py`
+
+The current `tool_read_memory` reads from `agent_memory` (cross-session). It does not touch `chat.cheatsheet` (per-chat). A separate tool is needed.
+
+```python
+# args_schema
+{
+  "confidence": {
+    "type": "string",
+    "enum": ["verified", "inferred", "conflicted"],
+    "description": "Filter entries by confidence level. Omit to return all."
+  },
+  "well": {
+    "type": "string",
+    "description": "Filter to a specific well name (normalised: NNM-101 → nnm101). Omit for all wells."
+  }
+}
+# passthrough_params: chat_id, project_id, session_id, trace_id
+```
+
+Implementation: call `project_service.get_chat_cheatsheet(chat_id)`, parse with `parse_cheatsheet()`, filter by `confidence` and `_normalize_entity_key(well)`, return formatted text grouped by bucket (`data_insights`, `key_facts`, `lessons_learned`).
+
+Primary use in Execute: verify a known fact before running an expensive retrieval tool. If `confidence="verified"` returns complete data for the queried well, the DDR/WellView query can be skipped.
+
+---
+
+### Step 2 — `tool_read_chat_history`
+
+**File:** `app/agents/tools/toolbox/mem_storage_toolbox.py`
+
+The framework injects recent exchanges via `load_message_history()`. This tool provides access to exchanges outside that window — older history or history from a specific point.
+
+```python
+# args_schema
+{
+  "n": {
+    "type": "integer",
+    "default": 20,
+    "description": "Number of exchanges (user+agent pairs) to return."
+  },
+  "before_record_id": {
+    "type": "integer",
+    "description": "Return exchanges before this record ID. Use to page backwards through history."
+  },
+  "oldest_first": {
+    "type": "boolean",
+    "default": true
+  }
+}
+# passthrough_params: chat_id, project_id, session_id, trace_id
+```
+
+Implementation: call `project_service.get_chat_records(chat_id, limit=n*2, before_record_id=..., oldest_first=...)`, pair user and agent records chronologically, return as formatted transcript.
+
+Primary use in Execute: report and reconciliation skills that need to reference exchanges from earlier in the conversation than the injected window covers.
+
+---
+
+### Step 3 — Extend `tool_read_memory` for top-K entity retrieval
+
+**File:** `app/agents/tools/toolbox/mem_storage_toolbox.py` (existing tool)
+
+Current behaviour: exact name lookup (`name="entity_nnm101"`). Add a `query` parameter that performs entity/keyword matching against `name` and `content_text`, returning the top-K most relevant entries.
+
+```python
+# additional args_schema fields
+{
+  "query": {
+    "type": "string",
+    "description": "Entity or keyword search against memory name and content. Returns top_k matches. Use instead of 'name' for broad retrieval."
+  },
+  "top_k": {
+    "type": "integer",
+    "default": 5,
+    "description": "Maximum number of entries to return when using 'query'."
+  }
+}
+```
+
+Implementation (Phase 1 — keyword match): when `query` is provided, fetch all PROJECT-scoped entries for `project_id`, rank by: (a) well name present in `name`, (b) keyword overlap with `content_text`. Return top-K.
+
+Implementation (Phase 2 — semantic search): add an `embedding` vector column to `agent_memory`, embed `content_text` at write time (ConsolidationAgent), use pgvector cosine similarity at read time. Phase 1 is sufficient for current project scale.
+
+This is also the tool `MemoryService.retrieve_project_memory()` calls internally — the service is not a separate DB path, it composes the same tools.
+
+---
+
+### Step 4 — `MemoryService`
+
+**File:** `app/services/memory/memory_service.py`
+
+The service assembles the initial prompt context for each node before the LLM call. It is the Python-layer counterpart to the tool functions — tools run inside the LLM execution loop; the service runs in the framework before each node is invoked.
+
+#### Data structures
+
+```python
+@dataclass
+class NodeContext:
+    system: str       # system prompt: soul + agent.md (+ skill.md for P and Ex)
+    context: str      # injected context block: CH, CS, user profile, retrieved PM
+    state: str = ""   # structured output from prior node (U→P, P→Ex)
+```
+
+#### Interface
+
+```python
+class MemoryService:
+    def __init__(
+        self,
+        project_service: ProjectService,
+        agent_memory_service: AgentMemoryService,
+        chat_id: int,
+        project_id: int,
+        user_id: int,
+    ): ...
+
+    # Individual loaders
+    def load_soul(self) -> str
+    def load_agent_md(self) -> str
+    def load_skill(self, skill_name: str) -> str
+    def load_chat_history(self, n: int = 12) -> str
+    def load_cheatsheet(self, confidence: str = None) -> str
+    def load_user_profile(self) -> str
+    def retrieve_project_memory(self, entities: list[str], top_k: int = 5) -> str
+
+    # Node bundles — standard assembly per the injection map
+    def bundle_for_node(self, node: str, **kwargs) -> NodeContext
+```
+
+#### `bundle_for_node` mapping
+
+```python
+match node:
+    case "U":
+        system  = soul + agent_md
+        context = chat_history(12) + cheatsheet() + user_profile()
+                  + retrieve_project_memory(entities=kwargs["entities"])
+    case "P":
+        system  = soul + agent_md + skill(kwargs["skill_name"])
+        context = chat_history(12) + cheatsheet()
+        state   = kwargs["u_state"]   # structured output from U
+    case "Ex":
+        system  = soul + agent_md + skill(kwargs["skill_name"])
+        context = ""                  # tools handle on-demand loading
+        state   = kwargs["p_state"]   # execution plan from P
+    case "Ev":
+        system  = soul + agent_md
+        context = user_profile()
+        state   = kwargs["ex_state"]  # results from Ex
+```
+
+#### Caching
+
+`soul`, `agent_md`, and `skill` files are read from disk once per request and cached in `self._cache`. DB-backed loaders (`chat_history`, `cheatsheet`, `user_profile`, `retrieve_project_memory`) are not cached — they must reflect current DB state.
+
+#### Where it fits in the call stack
+
+```
+User request
+  └─ Ida agent (Python)
+       ├─ memory_service.bundle_for_node("U", entities=[...])  ← MemoryService
+       ├─ LLM call: Understand node
+       │    └─ produces u_state (intent, entities, known facts)
+       ├─ memory_service.bundle_for_node("P", skill_name=..., u_state=...)
+       ├─ LLM call: Plan node
+       │    └─ produces p_state (execution plan)
+       ├─ memory_service.bundle_for_node("Ex", skill_name=..., p_state=...)
+       ├─ LLM call: Execute node
+       │    ├─ tool_read_cheatsheet(...)        ← tool (LLM-driven)
+       │    ├─ tool_read_memory(query=...)      ← tool (LLM-driven)
+       │    └─ produces ex_state (results)
+       ├─ memory_service.bundle_for_node("Ev", ex_state=...)
+       └─ LLM call: Evaluate node
+```
+
+---
+
+### Step 5 — Wire into Ida
+
+Once Steps 1–4 are complete, the activation work is:
+
+1. **Instantiate `MemoryService`** at request entry in the Ida agent Python code, passing `chat_id`, `project_id`, `user_id`.
+2. **Replace manual prompt construction** at each node with `bundle_for_node(node, ...)`.
+3. **Update `AGENT.md`** — add instructions for each node to describe what context it receives and what structured state it must produce (especially U, which must emit `entities` for PM retrieval at the next call).
+4. **Register the two new tools** (`tool_read_cheatsheet`, `tool_read_chat_history`) in `mem_storage_toolbox.py` and wire them via `register_tools()`.
+
+#### Sequencing
+
+| Step | Dependency | Risk |
+|---|---|---|
+| 1 — `tool_read_cheatsheet` | None | Low — thin wrapper over existing DB query |
+| 2 — `tool_read_chat_history` | None | Low — thin wrapper over existing DB query |
+| 3 — extend `tool_read_memory` | None | Low — additive, existing name lookup unchanged |
+| 4 — `MemoryService` | Steps 1–3 | Medium — new abstraction, needs tests |
+| 5 — Wire into Ida | Step 4 | High — changes prompt construction for every node |
+
+Steps 1–3 are independent and can be done in parallel. Step 4 depends on 1–3 only for its internal `retrieve_project_memory` call; the rest of its loaders are standalone. Step 5 is the highest-risk step and should be done behind a feature flag or tested on a non-production chat first.
+
+---
+
 ## Appendix: DB Schema (relevant columns)
 
 ```
