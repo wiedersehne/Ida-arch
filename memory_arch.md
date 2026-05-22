@@ -43,7 +43,6 @@ flowchart TD
 
     subgraph EXT ["External — persistent structured storage"]
         CS_DB[("chat.cheatsheet\nper-chat JSON\nverified · inferred · conflicted")]
-        HABIT[("chat.habit\nper-chat behaviour profile")]
         subgraph AMEM ["agent_memory table"]
             PROJ[("PROJECT scope\nentity_{well}\nproject_facts\nproject_lessons")]
             USERP[("USER scope\nuser_profile")]
@@ -74,14 +73,12 @@ flowchart TD
     LOOP -->|new AGENT RESPONSE event| CSA
     CSA -->|curate per exchange| CS_DB
 
-    CS_DB & CRD -->|60min idle| HA
-    HA -->|extract habits| HABIT
+    CRD -->|60min idle\nread transcript| HA
+    HA -->|write user_profile\ndirectly| USERP
 
     CS_DB -->|60min idle\nor 3h cursor gap| CONS
-    HABIT -->|cross-session merge| CONS
     CONS -->|promote verified\ndata_insights + key_facts| PROJ
     CONS -->|promote verified+inferred\nlessons_learned| PROJ
-    CONS -->|merge user habits| USERP
 
     CS_DB -->|static injection| MS
     USERP -->|static injection| MS
@@ -242,8 +239,6 @@ Job 2 — Compress: messages > 2000 chars → 300-word summary → chat_record.c
 
 Confidence rules: `verified` = value appears verbatim in a tool result block · `inferred` = derived from narrative · `conflicted` = same metric has two values; both entries preserved, neither silently dropped.
 
-**`chat.habit` (text):** per-session user behaviour profile extracted by HabitAgent. Five dimensions: query style, interaction style, output preferences, domain focus, expertise signals. Structured with `## DIMENSION` headers.
-
 ### Cross-session storage (`agent_memory` table)
 
 | Scope | Key pattern | Written by | Content |
@@ -251,7 +246,7 @@ Confidence rules: `verified` = value appears verbatim in a tool result block · 
 | PROJECT | `entity_{well}` | ConsolidationAgent | Per-well data insights (merged, deduped) |
 | PROJECT | `project_facts` | ConsolidationAgent | Data quality gaps, confirmed characteristics |
 | PROJECT | `project_lessons` | ConsolidationAgent | Transferable operational insights |
-| USER | `user_profile` | ConsolidationAgent (from `chat.habit`) | Persistent user preferences across all projects |
+| USER | `user_profile` | HabitAgent (directly) | Persistent user preferences across all projects |
 | GLOBAL | `*_cursor` | All background agents | Bookkeeping: last processed record IDs |
 
 Schema: `agent_id`, `name`, `scope`, `project_id`, `user_id`, `object` (JSONB), `content_text` (FTS-indexed), `memory_type`, `confidence`, `version`.
@@ -338,32 +333,36 @@ flowchart TD
 
 #### HabitAgent
 
-Extracts per-user behavioural patterns at session end. Fires when a chat has been idle for 60 minutes with unprocessed records since `habit_cursor_ts`.
+Extracts per-user behavioural patterns at session end and writes them **directly** to USER-scoped `agent_memory` — no intermediate `chat.habit` hop. Fires when a chat has been idle for 60 minutes with unprocessed records since `habit_cursor_ts`.
+
+**Design note:** `get_user_id_from_chat` derives the user ID by looking up `sender_name` (user email) from USER records and joining to the `user` table. If no USER records exist for a chat (system or API chats), `user_id` is `None`, the cursor is advanced, and the chat is silently skipped.
 
 ```mermaid
 flowchart TD
-    A([poll every 300s]) --> B[get_idle_chats\nidle > 60min]
+    A([poll every 300s]) --> B[get_idle_chats\nSQL: max response_ts < now-1h\nAND max response_ts > habit_cursor_ts]
     B --> C{any chats?}
     C -- No --> A
     C -- Yes --> D[for each idle chat]
 
-    D --> E[get user_id from chat]
+    D --> E[get user_id\nfrom sender_name → user table]
     E --> F{user_id found?}
     F -- No --> G[advance cursor · skip]
-    F -- Yes --> H[load transcript since habit_cursor_ts]
+    F -- Yes --> H[fetch USER + AGENT records\nsince habit_cursor_ts · limit 200 each\nmerge and sort by id]
 
     H --> I{any records?}
     I -- No --> A
-    I -- Yes --> J[load existing USER profile\nfrom agent_memory]
+    I -- Yes --> J[load existing user_profile\nfrom agent_memory USER scope]
 
-    J --> K[LLM: extract habits · merge with existing]
-    K --> L{habits tag present?}
-    L -- No --> M[advance cursor · no write]
-    L -- Yes --> N[set_object user_profile · scope=USER]
+    J --> K[LLM: extract habits from transcript\nmerge with existing profile]
+    K --> L{&lt;habits&gt; tags present?}
+    L -- No --> M[keep existing · advance cursor]
+    L -- Yes --> N[set_object user_profile\nagent_memory · scope=USER · memory_type=USER_PROFILE]
     N --> O[advance habit_cursor_ts]
 
     style K fill:#f9f,stroke:#333
 ```
+
+**Five profile dimensions** captured: query style, interaction style, output preferences, domain focus, expertise signals. Update strategy: confirms → unchanged; strengthened → add "(confirmed)"; contradicts → soften; new pattern → append. One line per observation, no elaboration.
 
 ---
 
@@ -485,7 +484,6 @@ chat
   cheatsheet              TEXT         — JSON CheatsheetData, written by CheatsheetAgent
   cheatsheet_cursor_ts    TIMESTAMP    — last exchange processed by CheatsheetAgent
   consolidation_cursor_ts TIMESTAMP    — last cheatsheet state consolidated to agent_memory
-  habit                   TEXT         — per-session user behaviour profile (HabitAgent)
   habit_cursor_ts         TIMESTAMP    — last exchange processed by HabitAgent
 
 agent_memory
