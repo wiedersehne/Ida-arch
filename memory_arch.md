@@ -128,7 +128,7 @@ flowchart TB
     subgraph CC_AGENT ["ContextCompressor"]
         CC_T["Trigger: USER + AGENT records\nevent + 120s fallback"]
         CC_J1["Job 1: RAG embed\nsync · idempotent"]
-        CC_J2["Job 2: LLM compress\n≥2000 chars → ≤300 words\nasync thread pool"]
+        CC_J2["Job 2: LLM compress\ngt=2000 chars to lt=300 words\nasync thread pool"]
         CC_T --> CC_J1 --> CC_J2
     end
 
@@ -136,19 +136,19 @@ flowchart TB
         CSA_T["Trigger: AGENT RESPONSE only\nevent + 120s fallback"]
         CSA_TW["Tail window: default 6\nconfig tail_window_size e.g. 12"]
         CSA_PH["Phases 1–3 + 40min idle flush\nper-chat thread · dirty re-run"]
-        CSA_CUR["CheatsheetService curator\n→ chat.cheatsheet JSON"]
+        CSA_CUR["CheatsheetService curator\nwrites chat.cheatsheet JSON"]
         CSA_T --> CSA_TW --> CSA_PH --> CSA_CUR
     end
 
     subgraph CONS_AGENT ["ConsolidationAgent"]
         CONS_T["Trigger: 300s poll\n60min idle OR 3h cursor gap"]
-        CONS_PROM["Promote verified →\nentity_* · project_facts · project_lessons"]
+        CONS_PROM["Promote verified findings\nentity_* · project_facts · project_lessons"]
         CONS_T --> CONS_PROM
     end
 
     subgraph HA_AGENT ["HabitAgent"]
         HA_T["Trigger: 300s poll\n60min idle"]
-        HA_PROF["Merge transcript → user_profile\nPROJECT scope + user_id"]
+        HA_PROF["Merge transcript to user_profile\nPROJECT scope + user_id"]
         HA_T --> HA_PROF
     end
 
@@ -304,12 +304,12 @@ flowchart TD
     C --> D["Main loop drains queue"]
     D --> E["_process_record"]
 
-    E --> F["Job 1 — Index  synchronous\ncheck get_indexed_chat_record_ids\nskip if already indexed\nadd_document_batch → generate_embeddings"]
+    E --> F["Job 1 — Index synchronous\ncheck get_indexed_chat_record_ids\nskip if already indexed\nadd_document_batch then generate_embeddings"]
 
-    E --> G{len(message) ≥ 2000\nAND no compressed_message?}
+    E --> G{len msg &gt;= 2000\nAND no compressed_message?}
     G -- No --> H([done])
     G -- Yes --> I["Job 2 — submit to\nsingle-worker thread pool\nnon-blocking"]
-    I --> J["LLM call  MICRO_SMART\nsummarize to ≤300 words"]
+    I --> J["LLM call MICRO_SMART\nsummarize to 300 words max"]
     J --> K["update_chat_record\n_compressed_message"]
 
     style F fill:#d4edda,stroke:#28a745
@@ -351,8 +351,8 @@ flowchart TD
 
     E --> F["_get_next_record\ntail window logic"]
     F --> G{Phase?}
-    G -- "Phase 1\ntotal ≤ tail_n" --> H["curate immediately"]
-    G -- "Phase 2\nunprocessed ≤ tail_n\ntotal > tail_n" --> I{idle > 40 min?}
+    G -- "Phase 1\ntotal lte tail_n" --> H["curate immediately"]
+    G -- "Phase 2\nunprocessed lte tail_n\ntotal gt tail_n" --> I{idle &gt; 40 min?}
     I -- No --> J([defer])
     I -- Yes --> H
     G -- "Phase 3\nunprocessed > tail_n" --> H
@@ -395,8 +395,8 @@ flowchart LR
     TR --> CSA_BOX
 
     subgraph CC_BOX ["ContextCompressor"]
-        CC1["each long message\n≥ 2000 chars"]
-        CC2["compressed to\n≤ 300 words"]
+        CC1["each long message\ngt= 2000 chars"]
+        CC2["compressed to\n300 words max"]
         CC1 --> CC2
     end
 
