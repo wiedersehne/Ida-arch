@@ -4,189 +4,311 @@
 
 ---
 
-## The Problem With "Just Add a Vector Store"
+## What Is Memory?
 
-When teams start adding memory to LLM agents, the default move is to reach for a vector database. Embed the conversation, store it, retrieve the top-K chunks at query time. Fast, easy, good enough for demos.
+In human cognition, memory is what separates a person who has to be told everything every time from a person who has learned. A junior engineer needs the context explained. A senior engineer already knows which wells in the field have problematic TVD data, how this operator labels their formations, and what has been tried before.
 
-It falls apart in production for domain-expert agents.
+For AI agents, the parallel is exact. A **stateless agent** answers each request from scratch using only what is in the prompt. A **memory-equipped agent** enters each conversation already knowing what was established before — and builds on it.
 
-A drilling engineer doesn't need a fuzzy semantic recall of what happened last Tuesday. She needs to know, with certainty, that the TD of NNM-101 is 2,630 m MD — not a probable guess, not a paraphrase, the actual confirmed number. She needs to know that the WellView export for NNM-103 is truncated at 3,200 m before she tries to analyse it, not discover it mid-answer. She needs to remember that this particular user prefers one-well-at-a-time answers with data quality flags surfaced up front.
+But memory is not simply "store everything and retrieve by similarity." The wrong memory is worse than no memory. An agent that confidently cites an unverified estimate as established fact, or surfaces preferences from a different project as if they apply here, is more dangerous than one that admits it doesn't know.
 
-This is the difference between **episodic retrieval** ("I seem to recall something about NNM-101") and **working knowledge** ("I know the following confirmed facts about this well"). For a domain expert, working knowledge is the product. Episodic retrieval is a fallback.
+The design question is not *whether* to add memory. It is *what to remember, at what confidence, for how long, and in what scope*.
 
-We built IDA's memory system around that distinction. This document explains the design principles and the patterns we landed on.
+---
+
+## Classifying Memory for Agents
+
+Before choosing a technical approach, we need a vocabulary. Memory in cognitive science is typically divided into four types. We find this classification directly useful for agent design.
+
+```mermaid
+flowchart LR
+    subgraph TYPES ["Memory types — cognitive model"]
+        WM["Working memory\nActive context window\nBounded, volatile"]
+        EP["Episodic\nWhat happened\nin past sessions"]
+        SEM["Semantic\nWhat is known\nabout the domain"]
+        PROC["Procedural\nHow to work\nwith this user"]
+    end
+
+    subgraph AGENT ["Agent implementation"]
+        CTX["Chat history\nlast N compressed exchanges"]
+        CS["Session cheatsheet\nstructured session findings"]
+        PM["Project memory\nverified entities, facts, lessons"]
+        UP["User profile\nper-project working style"]
+    end
+
+    WM --> CTX
+    EP --> CS
+    SEM --> PM
+    PROC --> UP
+```
+
+| Cognitive type | What it holds | Agent implementation | Lifetime |
+|---|---|---|---|
+| **Working** | Active context — what we are reasoning about right now | Chat history window | Within session |
+| **Episodic** | What happened — specific past events and their outcomes | Session cheatsheet | Per conversation |
+| **Semantic** | What is known — distilled facts about the world | Project memory | Persistent, per project |
+| **Procedural** | How to act — learned patterns of effective behaviour | User profile | Persistent, per user + project |
+
+This classification drives our architecture directly. Each type has different **latency requirements** (working memory must be instant; semantic memory can be async), different **confidence requirements** (semantic facts must be verified; procedural patterns can be inferred from behaviour), and different **scope requirements** (procedural preferences are project-contextual, not global).
+
+### The additional axis: trust
+
+Beyond lifetime and scope, memory entries differ in epistemic status. Not all things an agent observes are equally trustworthy:
+
+- **Verified** — a value that appeared verbatim in a tool result. The database said so.
+- **Inferred** — a conclusion the agent reached by reasoning. Probably right.
+- **Conflicted** — the same metric appears with two different values. Neither is safe to assert.
+
+General-purpose memory systems ignore this axis entirely. For a domain-expert agent working with real engineering data, it is the most important axis of all.
 
 ---
 
 ## Design Principles
 
-### 1. Capture is async. Always.
+From the classification above, we derived seven principles that constrain how IDA's memory is built.
 
-Memory writes must never be in the critical path of a user request. A drilling engineer asking "what's the ROP on NNM-102?" should not wait for an LLM to update a memory store before getting an answer.
+### Principle 1 — Capture is async. Always.
 
-In IDA, all four capture agents — ContextCompressor, CheatsheetAgent, ConsolidationAgent, HabitAgent — run as independent background services. They subscribe to a message bus or poll on a schedule. The request path touches none of them. From the user's perspective, memory "just gets better" between sessions.
+Working memory is in-request. Everything else is not. Episodic, semantic, and procedural memory are all built in the background by independent agents that subscribe to the conversation stream. They never block a user request.
 
-> **Pattern: Event-driven capture with async fallback poll.** Subscribe to `record_saved` for low-latency capture; poll on a 120-second fallback to recover events missed across restarts. Both paths are idempotent.
+This is not a performance optimisation. It is a correctness boundary. A memory write that could slow down or fail a user response would make the system less reliable, not more useful.
 
-### 2. Not all findings deserve the same permanence.
+### Principle 2 — Trust is a gate, not a label.
 
-The biggest mistake we see in agent memory systems is treating all observations as equal. Store everything, retrieve by relevance, trust the LLM to sort it out. This produces confident hallucination: the agent "remembers" something that was a guess and presents it as established fact.
+Confidence is not cosmetic metadata to display in the UI. It is the filter that controls what persists.
 
-We built a **confidence-gated promotion pipeline**. Every finding in IDA's session cheatsheet carries one of three labels:
+Verified findings can enter permanent project memory. Inferred findings can persist as context and lessons, but not as numeric facts. Conflicted findings are preserved in full — both values, with their source records — and never promoted until the conflict is resolved.
 
-- `verified` — the value appears verbatim in a tool result block. IDA pulled it from the database. It's a fact.
-- `inferred` — IDA reasoned to this conclusion from context. Probably right. Not guaranteed.
-- `conflicted` — two different values for the same metric appeared in the data. Neither is dropped. Neither is promoted until resolved.
+The trust axis is enforced structurally, not by convention.
 
-Promotion to permanent project memory is gated by confidence:
+### Principle 3 — Live context must be protected.
 
-```
-data_insights:   verified only → entity_{well} slots
-key_facts:       verified + inferred → project_facts (context, not calculations)
-lessons_learned: all → project_lessons (operational patterns, not numbers)
-```
+An agent's reasoning about a topic evolves within a session. The answer at turn 3 may be revised by turn 9. Curating turn 3 before the conversation settles bakes in a premature conclusion.
 
-Numeric claims that were not directly confirmed by tool data never leave the session cheatsheet. They are available within the session but do not pollute permanent memory with unverified numbers.
+A well-designed memory system must distinguish between **in-flight reasoning** and **settled findings**. The former should not be committed. The latter should be.
 
-> **Pattern: Confidence-gated promotion.** The persistence boundary is a trust boundary. Only findings that pass the confidence filter cross it.
+### Principle 4 — Upstream stages must settle before downstream stages read.
 
-### 3. Respect the tail. The agent is still thinking.
+Memory is a pipeline. If stage N reads from stage N-1, and stage N-1 is still writing, stage N will see a partial view. This produces silent errors — not crashes, but subtly wrong memory that looks correct.
 
-A naive cheatsheet system curates every exchange immediately. This creates a subtle problem: the agent's understanding of a topic evolves over a conversation. The answer to turn 3 might be revised by turn 7 when more data is pulled. If you curate turn 3 before the conversation settles, you bake in an outdated finding.
+Settlement must be explicit. Downstream stages wait for upstream stages to reach a stable state before running. This should be encoded as threshold design, not left to timing luck.
 
-We protect the last N exchanges as a **tail window** — a live working context where the agent can still revise conclusions before anything is committed to the cheatsheet. Only when an exchange scrolls past the tail boundary does it become eligible for curation.
+### Principle 5 — Domain entities are first-class keys.
 
-```
-exchanges:  1  2  3  4  5  6  7  8  9  10  11  12
-                                ↑─── tail window (6) ───↑
-curate now:  1  2  3  4  5  6
-defer:                         7  8  9  10  11  12
-```
+In a domain-expert agent, the real-world objects the agent reasons about — wells, formations, BHA configurations — are the natural primary keys for semantic memory. Flat text retrieval treats all findings as interchangeable. Entity-keyed memory treats findings about NNM-101 as structurally separate from findings about NNM-102, enabling precise retrieval and structured deduplication.
 
-For long sessions or when the user stops, an idle bypass flushes the tail so the cheatsheet fully settles before consolidation reads it.
+### Principle 6 — User preferences are scoped to context, not to identity.
 
-> **Pattern: Sliding tail window.** Commit findings only after the active reasoning window has moved on. Protect in-flight context from premature extraction.
+A person's preferred working style is not fixed across all contexts. How an engineer wants to interact with IDA on a routine shallow well is not the same as on a complex HP/HT operation. Preferences learned in one project context should not bleed into another.
 
-### 4. Stagger your settlement thresholds.
+Procedural memory must be scoped to the unit where the preferences apply.
 
-Memory stages depend on each other. Consolidation reads the cheatsheet. If consolidation runs while the cheatsheet is still mid-curation, it will promote a partial view of the session.
+### Principle 7 — Memory is infrastructure, not agent state.
 
-We use deliberately staggered idle thresholds:
+Agents that own their own memory create coupling. Adding a new agent means building new memory logic. Memory schemas diverge. Retrieval becomes inconsistent.
 
-```
-t =  0 min   User stops sending messages
-t = 40 min   CheatsheetAgent idle bypass — tail flushed, session cheatsheet settled
-t = 60 min   ConsolidationAgent fires — reads a fully settled cheatsheet
-t = 60 min   HabitAgent fires — reads the full session transcript
-```
-
-The 20-minute gap between cheatsheet settlement and consolidation is a **mandatory settling window**. It is not a polling artifact — it is intentional design.
-
-> **Pattern: Staggered cascade.** Upstream stages must settle before downstream stages read them. Express this as explicit idle thresholds, not as a single pipeline trigger.
-
-### 5. Domain entities are first-class keys.
-
-General-purpose memory systems store flat text or embeddings. For a domain agent, the entities *are* the schema.
-
-In IDA, project memory is keyed by drilling entity: `entity_nnm101`, `entity_nnm102`. Each slot holds all verified numeric findings for that well — TD, TVD, ROP, NPT, BHA configuration — merged and deduplicated across sessions. When IDA answers a question about NNM-101, she retrieves one slot, not a bag of loosely ranked chunks.
-
-Entity key normalization (`NNM-101`, `NNM_101`, `NNM 101` → `nnm101`) ensures that organic variation in how users refer to the same well doesn't create fragmented memory.
-
-> **Pattern: Entity-keyed memory slots.** For domain agents, the real-world entities in your domain are the natural primary keys. Design your memory schema around them, not around free-form text retrieval.
-
-### 6. User preferences are project-contextual, not global.
-
-Most agent memory systems store user preferences globally. One profile per user.
-
-This is wrong for expert users working across different contexts. A drilling engineer's preferred communication style when doing a quick ROP check on a routine well is not the same as when she is debugging a complex NPT event on a high-risk well. The context shapes the preference.
-
-IDA's user profile is scoped to `(user_id, project_id)`. Preferences learned on a shallow gas campaign do not transfer to a deep HP/HT project. IDA starts fresh per project — but within a project, she accumulates a refined understanding of how this user works in this context.
-
-> **Pattern: Project-scoped user preferences.** User style is context-dependent. Scope profiles to the relevant domain unit, not globally to the user account.
-
-### 7. Memory is a plugin service, not agent state.
-
-Early in the design we faced a choice: should each agent own its memory, or should memory be a shared infrastructure layer?
-
-We chose infrastructure. Every agent calls the same `MemoryStore` API, the same `MemoryService` loaders, the same `ProjectMemoryToolbox` tools. Adding a new agent that needs to remember something does not require changes to the memory system — it calls the existing API with its `agent_id`.
-
-This also means capture and retrieval are fully decoupled. CheatsheetAgent writes. MemoryService reads. They never call each other. The store is the only shared boundary.
-
-> **Pattern: Memory as infrastructure.** Agents are memory clients, not memory owners. The store is a shared service with a stable API.
+Memory should be a shared service with a stable API. Every agent writes to and reads from the same store. The store does not know or care which agent is calling. Agents are memory clients, not memory owners.
 
 ---
 
-## Architecture Summary
+## Techniques We Built
 
-Three planes. Four layers. One pipeline.
+Each principle maps to a concrete technical pattern in IDA's implementation.
+
+### Technique 1 — Three-plane architecture
+
+*Principle: capture is async; memory is infrastructure.*
+
+We separated the system into three completely decoupled planes:
 
 ```mermaid
 flowchart LR
-    CONV(["Conversation"])
+    CONV(["Conversation\nexchange"])
 
-    subgraph CAPTURE ["Capture — async, never blocks"]
-        CC["ContextCompressor\ncompress + index"]
-        CSA["CheatsheetAgent\ncurate per exchange"]
-        CONS["ConsolidationAgent\npromote at session end"]
-        HA["HabitAgent\nprofile at session end"]
+    subgraph CAPTURE ["Capture — async background agents"]
+        direction TB
+        CC["ContextCompressor\nevent-driven"]
+        CSA["CheatsheetAgent\nevent-driven"]
+        CONS["ConsolidationAgent\n300s poll"]
+        HA["HabitAgent\n300s poll"]
     end
 
-    subgraph STORE ["Store"]
+    subgraph STORE ["Store — shared infrastructure"]
+        direction TB
         RAG[("RAG index")]
-        CS[("session cheatsheet")]
-        AM[("project memory")]
-        UP[("user profile")]
+        CS[("chat.cheatsheet")]
+        AM[("agent_memory")]
     end
 
     subgraph RETRIEVE ["Retrieve — per request"]
-        MS["MemoryService"]
-        PMT["ProjectMemoryToolbox"]
+        direction TB
+        MS["MemoryService\n4 loaders"]
+        PMT["ProjectMemoryToolbox\n3 tools"]
     end
 
     CONV --> CC & CSA
     CC --> RAG
     CSA --> CS
     CS --> CONS --> AM
-    CONV --> HA --> UP
-    CS & AM & UP --> MS
-    RAG & AM --> PMT
+    CONV --> HA --> AM
+    CS & AM --> MS & PMT
     MS & PMT --> CONV
 ```
 
-**Four memory layers** — from volatile to persistent:
+**Capture** writes asynchronously and never touches the request path. **Store** is the only shared boundary. **Retrieve** reads from the store and assembles context per request — it never calls Capture directly. No plane knows about the internal workings of the others.
 
-| Layer | What it holds | Cognitive role |
+### Technique 2 — Confidence-gated promotion pipeline
+
+*Principle: trust is a gate.*
+
+Every finding extracted from a session carries a confidence label (`verified`, `inferred`, `conflicted`). Promotion to permanent project memory is gated:
+
+```mermaid
+flowchart LR
+    CS[("Session\ncheatsheet")]
+
+    CS --> DI["data_insights"]
+    CS --> KF["key_facts"]
+    CS --> LL["lessons_learned"]
+
+    DI -->|"verified only"| EW[("entity_{well}\npermanent")]
+    KF -->|"verified + inferred"| PF[("project_facts\npermanent")]
+    LL -->|"all"| PL[("project_lessons\npermanent")]
+
+    DI -->|"inferred — stays\nin cheatsheet only"| BLOCK["not promoted"]
+
+    style BLOCK fill:#fde,stroke:#c00
+    style EW fill:#d4edda,stroke:#28a745
+    style PF fill:#d4edda,stroke:#28a745
+    style PL fill:#d4edda,stroke:#28a745
+```
+
+Numeric claims that were not directly confirmed by a tool result never leave the session boundary. Key facts and operational lessons — which are valuable even as inferences — can cross the boundary because they are context, not calculations. `conflicted` entries are preserved in full with both source records, and surface both values when queried.
+
+This is the mechanism that keeps IDA from confidently asserting unverified numbers in permanent memory.
+
+### Technique 3 — Sliding tail window
+
+*Principle: live context must be protected.*
+
+CheatsheetAgent does not curate every exchange immediately. It maintains a **tail window** of the last N exchanges that are protected from curation while the conversation is active. An exchange becomes eligible only when it scrolls past the tail boundary — meaning at least N newer exchanges have arrived, confirming the agent has moved on.
+
+```
+exchanges:   1   2   3   4   5   6   7   8   9  10  11  12
+                                     ├─── tail window ────┤
+curate now:  1   2   3   4   5   6
+defer:                               7   8   9  10  11  12
+```
+
+Three phases govern the behaviour:
+
+| Phase | Condition | Action |
 |---|---|---|
-| Chat history | Last N compressed exchanges | Working memory |
-| Session cheatsheet | Structured findings from this chat | Episodic |
-| Project memory | Verified entities, facts, lessons | Semantic |
-| User profile | Working style, per project | Procedural |
+| Young chat | Total exchanges <= tail_n | Curate each exchange immediately — tail has no effect yet |
+| Accumulating | Unprocessed <= tail_n, total > tail_n | Defer — wait for the tail to fill |
+| Sliding window | Unprocessed > tail_n | Oldest has scrolled out — curate immediately |
+| Idle bypass | Last exchange > 40 min ago | Flush all tail records regardless of phase |
+
+The tail window size is configurable (`tail_window_size`, default 6; production drilling sessions use 12).
+
+### Technique 4 — Staggered idle cascade
+
+*Principle: upstream stages must settle before downstream stages read.*
+
+Capture agents run on deliberately staggered thresholds:
+
+```mermaid
+timeline
+    title After the last exchange
+    section 40 minutes
+        CheatsheetAgent idle bypass : Tail flushed
+                                    : Session cheatsheet fully settled
+    section 60 minutes
+        ConsolidationAgent : Reads settled cheatsheet
+                           : Promotes to project memory
+        HabitAgent         : Reads full session transcript
+                           : Merges into user profile
+```
+
+The 20-minute gap between cheatsheet settlement and consolidation is not an accident. ConsolidationAgent must read the cheatsheet *after* CheatsheetAgent has finished writing it. This is expressed as explicit threshold design, not runtime synchronisation.
+
+For long active sessions without a 60-minute idle gap, ConsolidationAgent also fires when the cheatsheet cursor has run more than 3 hours ahead of the consolidation cursor — preventing memory from going stale mid-session.
+
+### Technique 5 — Entity-keyed semantic memory
+
+*Principle: domain entities are first-class keys.*
+
+Project memory is not a flat bag of text chunks. It is structured around the entities IDA reasons about:
+
+```
+agent_memory
+  entity_nnm101  →  ["TD 2630 m MD", "NPT 54 h in 8.5in section", "ROP avg 18 m/hr"]
+  entity_nnm102  →  ["max TVD 2562 m", "MD at TD 3845 m", "deviated well — use MD as primary"]
+  project_facts  →  ["WellView export NNM-103 truncated at 3200 m", ...]
+  project_lessons → ["Recompute ROP from delta-MD/time when DDR avg_rop shows repeated values", ...]
+```
+
+Entity key normalisation (`NNM-101`, `NNM_101`, `NNM 101` → `nnm101`) ensures that organic variation in how users refer to the same well does not create fragmented memory.
+
+When new findings arrive, they are not appended blindly. They are merged into the existing slot via an LLM synthesis step: duplicates are collapsed, the most specific version of each fact is kept, numerical conflicts are flagged with both values, and subsumed entries are dropped.
+
+### Technique 6 — Per-project user profiles
+
+*Principle: user preferences are scoped to context.*
+
+User profiles are stored with a composite key of `(user_id, project_id)`. Preferences learned on a routine gas well do not transfer to a complex HP/HT project. IDA builds separate profiles per project.
+
+HabitAgent observes five dimensions — query style, interaction style, output preferences, domain focus, expertise signals — and updates each dimension by evidence accumulation, not replacement:
+
+| New observation | Update |
+|---|---|
+| Consistent with existing | Unchanged |
+| Repeated across sessions | Marked "(confirmed)" |
+| Contradicts existing | Softened ("sometimes prefers…") |
+| Not previously seen | Appended as new observation |
+
+The profile is always injected in full at session start — not retrieved by search. It is small by design (free-form text, five dimensions, one line each) and its value is in being always present, not in being searched.
+
+### Technique 7 — Hybrid retrieval (FTS + vector)
+
+*Principle: memory is infrastructure.*
+
+Project memory entries are retrieved via PostgreSQL full-text search (`plainto_tsquery`, ranked by `ts_rank`) against the `content_text` field — a plain-text rendering of the structured `object` payload. This gives fast, auditable, keyword-aware retrieval without the overhead of vector similarity for short structured entries.
+
+For deeper conversational recall ("did we see this before?"), a separate RAG index backed by pgvector provides hybrid semantic + keyword search across all indexed chat records — cross-chat, within project.
+
+The two retrieval mechanisms serve different use cases and are exposed as separate tools:
+
+| Tool | Index | Use case |
+|---|---|---|
+| `tool_recall_project_memory` | FTS on `agent_memory.content_text` | Known distilled facts, always injected at session start |
+| `tool_search_chat_history` | pgvector + keyword on `rag_embeddings` | Ad-hoc recall — "did we discuss this before?" |
 
 ---
 
 ## Comparison With Common Approaches
 
-| Approach | What it gets right | What it misses |
+| Approach | Strength | Limitation vs. IDA's design |
 |---|---|---|
-| **Flat file memory** (e.g. Hermes MEMORY.md) | Predictable, prefix-cache friendly, agent-curated | No confidence tiers, no entity keys, single flat namespace |
-| **Vector-only RAG** | Scales, fuzzy recall | No trust boundary, no entity structure, expensive at injection |
-| **Graph memory** (e.g. Mem0) | Rich relationships | Complex to maintain, harder to audit, schema drift |
-| **Per-session summarisation** | Simple, bounded | Loses cross-session continuity, no entity consolidation |
-| **IDA's pipeline** | Confidence-gated, entity-keyed, staggered cascade, async capture | More components to operate; settling latency (40–60 min) before full persistence |
+| **Flat file memory** (e.g. Hermes) | Predictable, prefix-cache friendly, agent-curated | No confidence tiers, flat namespace, no entity keys |
+| **Vector-only RAG** | Scales well, fuzzy recall | No trust boundary, no structured entities, expensive at injection time |
+| **Graph memory** (e.g. Mem0) | Rich relational structure | Complex to maintain, harder to audit, schema drift over sessions |
+| **Per-session summarisation** | Simple and bounded | Loses cross-session continuity, no entity consolidation |
+| **IDA's pipeline** | Confidence-gated, entity-keyed, staggered, domain-structured | More components to operate; 40–60 min settling latency before full persistence |
 
-No approach is universally right. IDA's design trades operational simplicity (more moving parts) for **epistemic correctness** — which matters more for a domain expert agent where wrong facts are worse than no facts.
+The trade-off IDA makes is explicit: operational complexity in exchange for **epistemic correctness** — which matters more for a domain expert agent where a wrong fact is worse than no fact.
 
 ---
 
 ## What We Would Do Differently
 
-**Shorter settling time.** 40 minutes for cheatsheet settlement is long for fast-moving sessions. We would reduce this with a smarter idle detector — one that responds to session pause patterns rather than a fixed threshold.
+**Shorter settling time.** 40 minutes for cheatsheet settlement was conservative. A smarter idle detector — one that triggers on session pause patterns rather than fixed elapsed time — would let the cheatsheet settle in minutes for short sessions and still protect long ones.
 
-**`trace_id`-based exchange pairing.** Today, CheatsheetAgent pairs an agent response with "the most recent USER message before this record ID." For rapid multi-well sessions, this can mis-pair a question with the wrong answer. The right fix is to pair by `trace_id` — the ID that already links REQUEST and RESPONSE in the database.
+**Exchange pairing by `trace_id`.** CheatsheetAgent currently pairs an agent response with "the most recent USER message before this record ID." The right fix is to pair by `trace_id`, the ID that already links REQUEST and RESPONSE in our schema. This eliminates mis-pairing in rapid multi-well sessions.
 
-**Verified promotion for inferred data_insights.** Currently `inferred` numeric claims never reach project memory. A future improvement would allow them to graduate to `verified` when the same value is independently confirmed in a later session — accumulating evidence across turns rather than requiring single-turn confirmation.
+**Evidence accumulation for inferred findings.** Today, `inferred` numeric claims never reach project memory. A future improvement would let them graduate to `verified` when the same value is independently confirmed in a later session — accumulating evidence across turns rather than requiring single-session confirmation.
 
-**Memory expiry.** Project memory currently has no TTL. A well TD established six months ago on an old dataset should decay in confidence over time, not persist indefinitely at `0.85`.
+**Memory expiry.** A verified well TD from six months ago on an outdated dataset should decay in confidence. Project memory currently has no TTL and no confidence decay. Adding time-weighted confidence would make the system more honest about the freshness of what it knows.
 
 ---
 
@@ -194,9 +316,9 @@ No approach is universally right. IDA's design trades operational simplicity (mo
 
 The right mental model for agent memory is not a database. It is a **colleague who pays attention**.
 
-A good colleague remembers the confirmed facts, keeps the uncertain ones provisional, notices when something conflicts with what they knew before, and does not burden every conversation with things they learned on a different project. They update their model of how you work over time, without you asking them to.
+A good colleague remembers confirmed facts, keeps uncertain conclusions provisional, surfaces conflicts rather than resolving them silently, does not carry assumptions from one project into another, and adjusts how they communicate based on how you work. They do all of this without being asked, without slowing you down, and without claiming to know more than they do.
 
-That is the standard we designed to. The architecture is the mechanism. The standard is the goal.
+That is the standard we designed to. The classification, the principles, and the techniques are all in service of that standard.
 
 ---
 
