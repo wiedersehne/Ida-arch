@@ -94,20 +94,17 @@ flowchart LR
 
     subgraph IDA ["IDA"]
         direction TB
-        CTX["Context window\nactive request"]
         CH["Chat history\nper-chat transcript"]
         CSH["Session cheatsheet\nconsolidation buffer"]
         PM["Project memory\nentity + facts + lessons"]
         UP["User profile\nper-project style"]
     end
 
-    WM -.-> CTX
     EP -.-> CH
     CBUF -.-> CSH
     SEM -.-> PM
     PROC -.-> UP
 
-    CORE -.-> CTX
     RECALL -.-> CH
     ARCH -.-> PM
 
@@ -115,13 +112,12 @@ flowchart LR
     REFL -.-> PM
 ```
 
-| IDA component | Cognitive science | MemGPT / Letta | Generative Agents | Lifetime | Scope |
+| IDA memory store | Cognitive science | MemGPT / Letta | Generative Agents | Lifetime | Scope |
 |---|---|---|---|---|---|
-| **Context window** | Working memory (Baddeley) | Core memory | — | Per request | Per request |
-| **Chat history** | Episodic memory (Tulving) | Recall memory | Memory stream | Per conversation | Per chat |
-| **Session cheatsheet** | Semantic — session-scoped, pre-consolidation | — | Reflection (partial) | Per conversation | Per chat |
-| **Project memory** | Semantic — consolidated, stable (Tulving) | Archival memory | Reflection output | Persistent | Per project |
-| **User profile** | Procedural memory (Cohen & Squire) | Core memory (persona) | — | Persistent | Per user + project |
+| **Chat history** | Episodic (Tulving) | Recall memory | Memory stream | Per conversation | Per chat |
+| **Session cheatsheet** | Semantic — pre-consolidation (Squire) | — | Reflection (partial) | Per conversation | Per chat |
+| **Project memory** | Semantic — consolidated (Tulving) | Archival memory | Reflection output | Persistent | Per project |
+| **User profile** | Procedural (Cohen & Squire) | Core memory (persona) | — | Persistent | Per user + project |
 
 ### Where IDA extends the frameworks
 
@@ -147,73 +143,85 @@ This is the mechanism that prevents unverified numbers from entering permanent m
 
 Each IDA memory component is described by three axes: cognitive type, scope, and trust level.
 
-| Component | Cognitive type | Consolidation stage | Scope | Trust |
+| Memory store | Cognitive type | Consolidation stage | Scope | Trust filter |
 |---|---|---|---|---|
-| Context window | Working | Active | Per request | — |
-| Chat history | Episodic | Raw | Per chat | Unfiltered |
-| Session cheatsheet | Semantic | Pre-consolidation | Per chat | All tiers |
+| Chat history | Episodic | Raw | Per chat | None — full transcript |
+| Session cheatsheet | Semantic | Pre-consolidation | Per chat | All tiers captured |
 | Project memory | Semantic | Consolidated | Per project | Verified + selective inferred |
 | User profile | Procedural | Consolidated | Per user + project | Inferred from behaviour |
 
-Two orthogonal axes — cognitive type and consolidation stage — together describe what IDA's memory holds and how far it has been distilled. The trust axis then determines what survives promotion from one stage to the next. Without trust as a gate, the episodic-to-semantic pipeline would carry unverified claims into permanent memory — which is the failure mode of every general-purpose agent memory system we reviewed.
+Two orthogonal axes — **cognitive type** and **consolidation stage** — describe what each store holds and how far it has been distilled. The **trust filter** determines what survives promotion between stages. Without it, the episodic-to-semantic pipeline would carry unverified claims into permanent memory — which is the failure mode of every general-purpose memory system we reviewed.
 
 ---
 
 ## Design Principles
 
-From the classification above, we derived seven principles that constrain how IDA's memory is built.
+These principles are not aspirational statements — each one is a decision IDA's architecture had to make explicitly, with a concrete consequence if it had gone the other way.
 
-### Principle 1 — Capture is async. Always.
+### Principle 1 — Separate capture, store, and retrieve into three independent planes
 
-Working memory is in-request. Everything else is not. Episodic, semantic, and procedural memory are all built in the background by independent agents that subscribe to the conversation stream. They never block a user request.
+IDA's first architectural decision was to treat memory as three fully decoupled concerns. **Capture** agents write asynchronously in the background — they subscribe to the conversation stream and never touch the request path. **Store** is shared infrastructure with a stable API that every agent calls equally. **Retrieve** assembles context per request and never writes.
 
-This is not a performance optimisation. It is a correctness boundary. A memory write that could slow down or fail a user response would make the system less reliable, not more useful.
+Without this separation, the alternatives are: agents that own their memory (schema fragmentation, coupling), or writes in the request path (latency, reliability failure). The three-plane model makes memory a platform, not a feature of individual agents.
 
-### Principle 2 — Trust is a gate, not a label.
+### Principle 2 — Treat episodic and semantic memory as structurally distinct stores
 
-Confidence is not cosmetic metadata to display in the UI. It is the filter that controls what persists.
+This follows directly from Tulving. Episodic memory (chat history) is contextually grounded — who said what, in what sequence. Semantic memory (project memory) is decontextualized — facts about the world, independent of when or how they were learned. Conflating them into a single retrieval index loses the structural distinction.
 
-Verified findings can enter permanent project memory. Inferred findings can persist as context and lessons, but not as numeric facts. Conflicted findings are preserved in full — both values, with their source records — and never promoted until the conflict is resolved.
+IDA stores them separately: `chat_record` for episodic, `agent_memory` for semantic. Queries against each use different retrieval mechanisms (full-text + vector for episodic search; FTS on distilled entities for semantic recall). The cheatsheet sits between them as the consolidation stage — session-scoped semantic, not yet promoted.
 
-The trust axis is enforced structurally, not by convention.
+### Principle 3 — Confidence is a structural gate, not a label
 
-### Principle 3 — Live context must be protected.
+The single most consequential design decision. Confidence (`verified`, `inferred`, `conflicted`) is not metadata displayed in the UI — it is the filter that controls what crosses the boundary from session-scoped to persistent semantic memory.
 
-An agent's reasoning about a topic evolves within a session. The answer at turn 3 may be revised by turn 9. Curating turn 3 before the conversation settles bakes in a premature conclusion.
+Every `inferred` numeric claim — something IDA reasoned to rather than read from a tool result — stays in the session cheatsheet and never enters project memory. Every `conflicted` entry is preserved in full with both source records and neither value is asserted. Only `verified` data insights — values that appeared verbatim in a tool result — are promoted.
 
-A well-designed memory system must distinguish between **in-flight reasoning** and **settled findings**. The former should not be committed. The latter should be.
+This is enforced in ConsolidationAgent's code, not by convention. For a domain-expert agent, a wrong fact in permanent memory is worse than no fact — it generates confident errors on every future query.
 
-### Principle 4 — Upstream stages must settle before downstream stages read.
+### Principle 4 — Do not curate what the agent is still reasoning about
 
-Memory is a pipeline. If stage N reads from stage N-1, and stage N-1 is still writing, stage N will see a partial view. This produces silent errors — not crashes, but subtly wrong memory that looks correct.
+IDA's reasoning about a topic evolves within a session. The answer at turn 3 may be revised by turn 9 as more data is pulled. Committing turn 3 to the cheatsheet before the session settles bakes in a premature conclusion.
 
-Settlement must be explicit. Downstream stages wait for upstream stages to reach a stable state before running. This should be encoded as threshold design, not left to timing luck.
+CheatsheetAgent maintains a sliding tail window of the last N exchanges. Exchanges are not eligible for curation until they have scrolled past the tail boundary — meaning N newer exchanges have arrived and the agent's working context has moved on. The tail window is the mechanism for distinguishing in-flight reasoning from settled findings.
 
-### Principle 5 — Domain entities are first-class keys.
+### Principle 5 — Upstream stages must settle before downstream stages read
 
-In a domain-expert agent, the real-world objects the agent reasons about — wells, formations, BHA configurations — are the natural primary keys for semantic memory. Flat text retrieval treats all findings as interchangeable. Entity-keyed memory treats findings about NNM-101 as structurally separate from findings about NNM-102, enabling precise retrieval and structured deduplication.
+Memory in IDA is a pipeline: episodic → session-scoped semantic → consolidated semantic. Each stage reads from the previous one. If ConsolidationAgent reads the cheatsheet while CheatsheetAgent is still curating, it promotes a partial view of the session into permanent memory — a silent error, not a crash.
 
-### Principle 6 — User preferences are scoped to context, not to identity.
+IDA encodes settlement as explicit idle thresholds: CheatsheetAgent flushes its tail at 40 minutes of inactivity; ConsolidationAgent runs at 60 minutes. The 20-minute gap is the deliberate settling window. These thresholds are not polling intervals — they are the designed sequencing mechanism.
 
-A person's preferred working style is not fixed across all contexts. How an engineer wants to interact with IDA on a routine shallow well is not the same as on a complex HP/HT operation. Preferences learned in one project context should not bleed into another.
+### Principle 6 — Domain entities are the primary key of semantic memory
 
-Procedural memory must be scoped to the unit where the preferences apply.
+General-purpose memory systems store semantic knowledge as flat text or embedding vectors — a bag of facts retrieved by similarity. For a domain-expert agent, the real-world entities being reasoned about are the natural organizing unit.
 
-### Principle 7 — Memory is infrastructure, not agent state.
+IDA's semantic memory is keyed by drilling entity: `entity_nnm101`, `entity_nnm102`. Each entity has a named slot that accumulates verified findings across sessions and merges them via LLM synthesis — deduplicating, resolving conflicts, and dropping subsumed entries. This produces retrieval that is precise and structured, not probabilistically ranked across an undifferentiated corpus.
 
-Agents that own their own memory create coupling. Adding a new agent means building new memory logic. Memory schemas diverge. Retrieval becomes inconsistent.
+### Principle 7 — Procedural memory is scoped to where the preferences apply
 
-Memory should be a shared service with a stable API. Every agent writes to and reads from the same store. The store does not know or care which agent is calling. Agents are memory clients, not memory owners.
+Most agent systems store user preferences globally: one profile per user account. This assumes preferences are stable across contexts. For a drilling engineer, they are not — working style on a routine well differs from a complex operation; terminology expectations differ between projects.
+
+IDA scopes the user profile to `(user_id, project_id)`. Preferences learned on one project do not transfer to another. HabitAgent builds a separate profile per project context, using evidence accumulation (not replacement) to update each dimension as sessions accumulate.
 
 ---
 
 ## Techniques We Built
 
-Each principle maps to a concrete technical pattern in IDA's implementation.
+Each principle maps directly to a technical pattern. The table below shows the correspondence before diving into each technique.
+
+| Principle | Technique |
+|---|---|
+| Separate capture, store, retrieve | Three-plane architecture |
+| Episodic and semantic are distinct | Two-stage semantic pipeline (cheatsheet → project memory) |
+| Confidence is a structural gate | Confidence-gated promotion |
+| Protect in-flight reasoning | Sliding tail window |
+| Upstream stages settle first | Staggered idle cascade |
+| Entities are the primary key | Entity-keyed semantic memory with LLM synthesis |
+| Procedural memory is context-scoped | Per-project user profiles |
+| Distinct types need distinct retrieval | Hybrid FTS + vector retrieval |
 
 ### Technique 1 — Three-plane architecture
 
-*Principle: capture is async; memory is infrastructure.*
+*Principle: separate capture, store, and retrieve.*
 
 We separated the system into three completely decoupled planes:
 
@@ -253,9 +261,27 @@ flowchart LR
 
 **Capture** writes asynchronously and never touches the request path. **Store** is the only shared boundary. **Retrieve** reads from the store and assembles context per request — it never calls Capture directly. No plane knows about the internal workings of the others.
 
-### Technique 2 — Confidence-gated promotion pipeline
+### Technique 2 — Two-stage semantic pipeline
 
-*Principle: trust is a gate.*
+*Principle: episodic and semantic are structurally distinct.*
+
+Chat history (episodic) feeds the session cheatsheet (session-scoped semantic), which feeds project memory (consolidated semantic). The episodic-to-semantic transformation happens at the cheatsheet stage — CheatsheetAgent strips conversational context and extracts decontextualized facts. The semantic-to-consolidated promotion happens at the consolidation stage — ConsolidationAgent filters by confidence and merges into stable cross-session slots.
+
+```mermaid
+flowchart LR
+    CH[("Chat history\nepisodic\nfull exchanges")]
+    CS[("Session cheatsheet\nsemantic — pre-consolidation\nfacts + confidence tags")]
+    PM[("Project memory\nsemantic — consolidated\nverified + merged")]
+
+    CH -->|"CheatsheetAgent\nextracts + tags"| CS
+    CS -->|"ConsolidationAgent\nfilters + merges"| PM
+```
+
+These are three different stores with different schemas and different access patterns. Treating them as one retrieval problem (e.g. a flat RAG over all memory) would erase the structural distinctions that make each layer trustworthy.
+
+### Technique 3 — Confidence-gated promotion
+
+*Principle: confidence is a structural gate.*
 
 Every finding extracted from a session carries a confidence label (`verified`, `inferred`, `conflicted`). Promotion to permanent project memory is gated:
 
@@ -283,9 +309,9 @@ Numeric claims that were not directly confirmed by a tool result never leave the
 
 This is the mechanism that keeps IDA from confidently asserting unverified numbers in permanent memory.
 
-### Technique 3 — Sliding tail window
+### Technique 4 — Sliding tail window
 
-*Principle: live context must be protected.*
+*Principle: do not curate what the agent is still reasoning about.*
 
 CheatsheetAgent does not curate every exchange immediately. It maintains a **tail window** of the last N exchanges that are protected from curation while the conversation is active. An exchange becomes eligible only when it scrolls past the tail boundary — meaning at least N newer exchanges have arrived, confirming the agent has moved on.
 
@@ -307,7 +333,7 @@ Three phases govern the behaviour:
 
 The tail window size is configurable (`tail_window_size`, default 6; production drilling sessions use 12).
 
-### Technique 4 — Staggered idle cascade
+### Technique 5 — Staggered idle cascade
 
 *Principle: upstream stages must settle before downstream stages read.*
 
@@ -330,9 +356,9 @@ The 20-minute gap between cheatsheet settlement and consolidation is not an acci
 
 For long active sessions without a 60-minute idle gap, ConsolidationAgent also fires when the cheatsheet cursor has run more than 3 hours ahead of the consolidation cursor — preventing memory from going stale mid-session.
 
-### Technique 5 — Entity-keyed semantic memory
+### Technique 6 — Entity-keyed semantic memory with LLM synthesis
 
-*Principle: domain entities are first-class keys.*
+*Principle: domain entities are the primary key of semantic memory.*
 
 Project memory is not a flat bag of text chunks. It is structured around the entities IDA reasons about:
 
@@ -348,9 +374,9 @@ Entity key normalisation (`NNM-101`, `NNM_101`, `NNM 101` → `nnm101`) ensures 
 
 When new findings arrive, they are not appended blindly. They are merged into the existing slot via an LLM synthesis step: duplicates are collapsed, the most specific version of each fact is kept, numerical conflicts are flagged with both values, and subsumed entries are dropped.
 
-### Technique 6 — Per-project user profiles
+### Technique 7 — Per-project user profiles
 
-*Principle: user preferences are scoped to context.*
+*Principle: procedural memory is scoped to where the preferences apply.*
 
 User profiles are stored with a composite key of `(user_id, project_id)`. Preferences learned on a routine gas well do not transfer to a complex HP/HT project. IDA builds separate profiles per project.
 
@@ -365,9 +391,9 @@ HabitAgent observes five dimensions — query style, interaction style, output p
 
 The profile is always injected in full at session start — not retrieved by search. It is small by design (free-form text, five dimensions, one line each) and its value is in being always present, not in being searched.
 
-### Technique 7 — Hybrid retrieval (FTS + vector)
+### Technique 8 — Hybrid retrieval (FTS + vector)
 
-*Principle: memory is infrastructure.*
+*Principle: episodic and semantic are distinct — so are their retrieval mechanisms.*
 
 Project memory entries are retrieved via PostgreSQL full-text search (`plainto_tsquery`, ranked by `ts_rank`) against the `content_text` field — a plain-text rendering of the structured `object` payload. This gives fast, auditable, keyword-aware retrieval without the overhead of vector similarity for short structured entries.
 
