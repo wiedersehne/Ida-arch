@@ -22,7 +22,7 @@ Before choosing a technical approach, we need a shared vocabulary. Several indus
 
 ### Industry frameworks
 
-**Cognitive science (Tulving, 1972–1985).** The foundational model distinguishes three long-term memory types: *episodic* (memory of specific events), *semantic* (general knowledge about the world), and *procedural* (how to perform actions). These sit above *working memory* — the bounded active buffer for current reasoning. This model has held up remarkably well as a design framework for AI systems.
+**Cognitive science (multi-author).** The field converged on four memory types across several decades of research. Tulving (1972, 1985) introduced the *episodic* vs. *semantic* distinction within long-term memory. Cohen & Squire (1980) separated *declarative* (episodic + semantic) from *procedural* memory. Baddeley & Hitch (1974) replaced the earlier short-term memory concept with *working memory* — a bounded, active buffer with multiple components (central executive, phonological loop, visuospatial sketchpad, and an episodic buffer added by Baddeley in 2000). Together these form the standard taxonomy the field has used ever since.
 
 **MemGPT / Letta (2023).** The first widely-cited agent memory architecture in the LLM era. Defines three stores: *core memory* (always in-context, like working memory + a persistent scratchpad), *recall memory* (searchable conversation history), and *archival memory* (unlimited external storage). Explicit context-window management with `memory_edit`, `recall_search`, and `archival_search` tools.
 
@@ -30,107 +30,132 @@ Before choosing a technical approach, we need a shared vocabulary. Several indus
 
 ### How IDA maps to these frameworks
 
+A careful reading of Tulving reveals something important: **chat history is episodic, not working memory**. Tulving's episodic memory is defined by its contextual grounding — specific events, temporally ordered, tied to when and where they occurred. A chat transcript is exactly that: a record of what was said, by whom, and in what sequence. Working memory (Baddeley) is the *active reasoning buffer* — the context window IDA holds during a single request, not the stored transcript.
+
+The more interesting observation is what the **session cheatsheet** actually is. Applying Tulving's test: episodic memory lets you mentally travel back to the original event — it preserves *who said what, when, in what context*. The cheatsheet does none of this. A cheatsheet entry is `{"entity": "NNM-101", "content": "TD 2630 m MD", "confidence": "verified", "record_id": 847}` — a decontextualized fact. The `record_id` is a provenance pointer for conflict detection, not episodic context. You cannot reconstruct the conversation from a cheatsheet entry.
+
+**The cheatsheet is semantic in content type** — it holds the same kind of decontextualized factual knowledge as project memory. The difference between them is not type but *consolidation stage*:
+
+- **Session cheatsheet** = session-scoped semantic memory — facts abstracted from this session's exchanges, still being updated, not yet filtered and promoted
+- **Project memory** = consolidated semantic memory — verified facts that have survived the promotion filter, been merged across sessions, and are stable
+
+Both cheatsheet and project memory are semantic. The pipeline from chat history → cheatsheet → project memory is the episodic-to-semantic abstraction process itself — which McClelland et al. (1995) showed is not instantaneous but requires a gradual consolidation stage to avoid catastrophic interference with existing knowledge.
+
+This maps precisely to how human memory consolidation works (Squire & Alvarez, 1995): the hippocampus holds episodic traces; offline consolidation (during sleep) gradually transfers verified knowledge to the neocortex as semantic memory, stripping the temporal and contextual metadata.
+
 ```mermaid
-flowchart TB
-    subgraph COG ["Cognitive Science (Tulving)"]
-        direction LR
-        CWM["Working\nmemory"]
-        CEP["Episodic\nmemory"]
-        CSEM["Semantic\nmemory"]
-        CPROC["Procedural\nmemory"]
+flowchart LR
+    subgraph HUMAN ["Human memory consolidation"]
+        direction TB
+        HC["Hippocampus\nepisodic traces\n(events + context)"]
+        SLEEP["Sleep / offline\nconsolidation"]
+        NC["Neocortex\nsemantic memory\n(facts, decontextualized)"]
+        HC --> SLEEP --> NC
+    end
+
+    subgraph IDA ["IDA memory pipeline"]
+        direction TB
+        CH["Chat history\nepisodic\n(exchanges + timestamps)"]
+        CS["Session cheatsheet\nconsolidation buffer\n(structured, confidence-tagged)"]
+        PM["Project memory\nsemantic\n(verified facts, no session context)"]
+        CH --> CS --> PM
+    end
+
+    HC -.->|analogous| CH
+    SLEEP -.->|analogous| CS
+    NC -.->|analogous| PM
+```
+
+The staggered idle thresholds (40 min cheatsheet settlement, 60 min consolidation) are not arbitrary — they are IDA's "sleep window." CheatsheetAgent is the hippocampus, holding and refining the episodic session record. ConsolidationAgent is the offline consolidation process, transferring verified findings into semantic memory while discarding unverified ones.
+
+```mermaid
+flowchart LR
+    subgraph COG ["Cognitive science"]
+        direction TB
+        WM["Working memory\n(Baddeley 1974)\nactive reasoning buffer"]
+        EP["Episodic memory\n(Tulving 1972)\nspecific events + context"]
+        CBUF["Consolidation\n(Squire 1995)\nhippocampus to neocortex"]
+        SEM["Semantic memory\n(Tulving 1985)\ndecontextualized facts"]
+        PROC["Procedural memory\n(Cohen and Squire 1980)\nbehavioural patterns"]
     end
 
     subgraph MG ["MemGPT / Letta"]
-        direction LR
+        direction TB
         CORE["Core memory\nalways in-context"]
         RECALL["Recall memory\nsearchable history"]
         ARCH["Archival memory\nexternal store"]
     end
 
     subgraph GA ["Generative Agents"]
-        direction LR
+        direction TB
         STREAM["Memory stream\nraw observations"]
         REFL["Reflection\nhigher-order insights"]
-        PLAN["Planning\nforward projection"]
     end
 
-    subgraph IDA ["IDA implementation"]
-        direction LR
-        CH["Chat history\nworking window"]
-        CSH["Session cheatsheet\nper-chat findings"]
+    subgraph IDA ["IDA"]
+        direction TB
+        CTX["Context window\nactive request"]
+        CH["Chat history\nper-chat transcript"]
+        CSH["Session cheatsheet\nconsolidation buffer"]
         PM["Project memory\nentity + facts + lessons"]
         UP["User profile\nper-project style"]
     end
 
-    CWM --> CH
-    CEP --> CSH
-    CSEM --> PM
-    CPROC --> UP
+    WM -.-> CTX
+    EP -.-> CH
+    CBUF -.-> CSH
+    SEM -.-> PM
+    PROC -.-> UP
 
-    CORE --> CH
-    RECALL --> CSH
-    ARCH --> PM
+    CORE -.-> CTX
+    RECALL -.-> CH
+    ARCH -.-> PM
 
-    STREAM --> CSH
-    REFL --> PM
+    STREAM -.-> CH
+    REFL -.-> PM
 ```
 
-| IDA class | Cognitive science | MemGPT / Letta | Generative Agents | Lifetime | Scope |
+| IDA component | Cognitive science | MemGPT / Letta | Generative Agents | Lifetime | Scope |
 |---|---|---|---|---|---|
-| **Chat history** | Working memory | Core memory | Memory stream (recent) | Session window | Per chat |
-| **Session cheatsheet** | Episodic memory | Recall memory | Memory stream (curated) | Per conversation | Per chat |
-| **Project memory** | Semantic memory | Archival memory | Reflection output | Persistent | Per project |
-| **User profile** | Procedural memory | Core memory (persona) | — | Persistent | Per user + project |
+| **Context window** | Working memory (Baddeley) | Core memory | — | Per request | Per request |
+| **Chat history** | Episodic memory (Tulving) | Recall memory | Memory stream | Per conversation | Per chat |
+| **Session cheatsheet** | Semantic — session-scoped, pre-consolidation | — | Reflection (partial) | Per conversation | Per chat |
+| **Project memory** | Semantic — consolidated, stable (Tulving) | Archival memory | Reflection output | Persistent | Per project |
+| **User profile** | Procedural memory (Cohen & Squire) | Core memory (persona) | — | Persistent | Per user + project |
 
 ### Where IDA extends the frameworks
 
-The three industry frameworks are designed for general-purpose agents. IDA adds two dimensions they do not address:
+The three industry frameworks are designed for general-purpose agents. IDA adds three dimensions they do not address:
 
-**1. The trust axis.** No existing framework has a first-class concept of epistemic confidence per memory entry. Hermes, MemGPT, and Generative Agents all treat memory entries as equally trustworthy. For a domain-expert agent working with real engineering data, this is a critical gap.
+**1. The consolidation buffer as a first-class component.** MemGPT has no equivalent of the session cheatsheet. Generative Agents' *reflection* is the closest analogue, but it is a single LLM call, not a staged pipeline with confidence filtering and a settlement window. IDA makes consolidation explicit: CheatsheetAgent accumulates the episodic buffer; ConsolidationAgent promotes verified findings to semantic memory after a deliberate settling period. The two-stage pipeline mirrors human memory consolidation more faithfully than any existing agent framework.
 
-IDA introduces three confidence tiers:
+**2. The trust axis.** No existing framework has a first-class concept of epistemic confidence per memory entry. All treat memory entries as equally trustworthy. IDA introduces three confidence tiers:
 
-| Tier | Meaning | Promoted to permanent memory? |
+| Tier | Meaning | Promoted to semantic memory? |
 |---|---|---|
 | `verified` | Value appears verbatim in a tool result | Yes — all slots |
 | `inferred` | Agent's reasoned conclusion from context | Context and lessons only — not numeric facts |
-| `conflicted` | Same metric, two different values in data | Preserved in full; neither assertion promoted |
+| `conflicted` | Same metric, two different values in data | Both preserved; neither promoted |
 
-This is the mechanism that keeps IDA from asserting unverified numbers as permanent facts. General-purpose agents can tolerate this ambiguity. A drilling engineer cannot.
+This is the mechanism that prevents unverified numbers from entering permanent memory. For a domain-expert agent, wrong facts are worse than no facts.
 
-**2. Entity-keyed semantic memory.** General frameworks store semantic memory as flat text or embeddings — a bag of facts retrieved by similarity. IDA's semantic memory is structured around domain entities: `entity_nnm101`, `entity_nnm102`. Each well is a named slot that accumulates verified findings across sessions and merges them via LLM synthesis. This produces retrieval that is precise and structured, not probabilistically ranked.
+**3. Entity-keyed semantic memory.** General frameworks store semantic memory as flat text or embeddings. IDA's semantic memory is structured around domain entities: `entity_nnm101`, `entity_nnm102`. Each entity is a named slot that accumulates verified findings across sessions and merges them via LLM synthesis. Retrieval is precise and structured, not probabilistically ranked.
 
-**3. Project-scoped procedural memory.** Hermes and MemGPT store user preferences globally. A user has one profile. IDA scopes procedural memory to `(user_id, project_id)` — because how an engineer works on a routine shallow well is not the same as on a complex HP/HT operation. This is an innovation over every existing framework we reviewed.
-
-**4. Memory consolidation as an explicit pipeline stage.** Generative Agents introduced *reflection* as LLM synthesis over raw events. IDA makes this a first-class pipeline stage: ConsolidationAgent reads the settled session cheatsheet and promotes findings to permanent memory through confidence filtering and LLM-mediated merging. The pipeline is staged, staggered, and auditable — not a background LLM call at random intervals.
+**4. Project-scoped procedural memory.** Hermes and MemGPT store user preferences globally. IDA scopes procedural memory to `(user_id, project_id)` — because how an engineer works on a routine shallow well is not the same as on a complex HP/HT project.
 
 ### The full classification
 
-Combining the cognitive model with IDA's two additional axes:
+Each IDA memory component is described by three axes: cognitive type, scope, and trust level.
 
-```mermaid
-flowchart LR
-    subgraph AXES ["Classification axes"]
-        direction TB
-        TYPE["Type\nWorking · Episodic\nSemantic · Procedural"]
-        SCOPE["Scope\nSession · Project · User"]
-        TRUST["Trust\nVerified · Inferred · Conflicted"]
-    end
+| Component | Cognitive type | Consolidation stage | Scope | Trust |
+|---|---|---|---|---|
+| Context window | Working | Active | Per request | — |
+| Chat history | Episodic | Raw | Per chat | Unfiltered |
+| Session cheatsheet | Semantic | Pre-consolidation | Per chat | All tiers |
+| Project memory | Semantic | Consolidated | Per project | Verified + selective inferred |
+| User profile | Procedural | Consolidated | Per user + project | Inferred from behaviour |
 
-    subgraph CLASSES ["IDA memory classes"]
-        direction TB
-        CH["Chat history\nWorking · Session · —"]
-        CSH["Session cheatsheet\nEpisodic · Per-chat · All tiers"]
-        PM["Project memory\nSemantic · Project · Verified+Inferred"]
-        UP["User profile\nProcedural · Per-user+project · Inferred"]
-    end
-
-    TYPE --> CLASSES
-    SCOPE --> CLASSES
-    TRUST --> CLASSES
-```
-
-Each IDA memory class is fully described by all three axes. The trust axis is what makes the classification rigorous for a domain-expert agent rather than a general-purpose one.
+Two orthogonal axes — cognitive type and consolidation stage — together describe what IDA's memory holds and how far it has been distilled. The trust axis then determines what survives promotion from one stage to the next. Without trust as a gate, the episodic-to-semantic pipeline would carry unverified claims into permanent memory — which is the failure mode of every general-purpose agent memory system we reviewed.
 
 ---
 
