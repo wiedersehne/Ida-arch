@@ -278,7 +278,7 @@ graph LR
 
 **Location:** `app/services/memory/memory_service.py`
 
-Assembles context strings before each LLM call. All loaders return `str` — `"(none)"` on empty results, never `None` and never raises.
+Assembles context strings before each LLM call. All loaders return `Optional[str]` — `None` on empty results, never raises.
 
 ### Construction
 
@@ -297,12 +297,12 @@ MemoryService(
 
 | Arg | Type | Default | Description |
 |---|---|---|---|
-| `project_service` | `Optional[ProjectService]` | `None` | Required for `load_short_term_memory` and `load_long_term_memory`. Without it those loaders return `"(none)"`. |
-| `memory_store` | `Optional[MemoryStore]` | `None` | Required for `load_project_memory` and `load_user_profile`. Without it those loaders return `"(none)"`. |
+| `project_service` | `Optional[ProjectService]` | `None` | Required for `load_short_term_memory` and `load_long_term_memory`. Without it those loaders return `None`. |
+| `memory_store` | `Optional[MemoryStore]` | `None` | Required for `load_project_memory` and `load_user_profile`. Without it those loaders return `None`. |
 | `tail_n` | `int` | `12` | Number of recent exchanges to include in `load_short_term_memory`. |
 | `top_k` | `int` | `3` | Max FTS hits returned by `load_project_memory`. |
 
-Both dependencies are optional so the service is safe to construct with no args (loaders degrade to `"(none)"` gracefully — useful in tests or background agents that don't need all loaders).
+Both dependencies are optional so the service is safe to construct with no args (loaders return `None` gracefully — useful in tests or background agents that don't need all loaders).
 
 ---
 
@@ -322,10 +322,10 @@ flowchart TD
     PM  -->|"search_objects\nFTS plainto_tsquery\nscope=PROJECT"| AM[("agent_memory")]
     UP  -->|"get_object\nagent_id=habit_agent\nname=user_profile"| AM
 
-    STM -->|str| OUT["Context string\ninjected into\nsystem prompt"]
-    LTM --> Out2["Context string\ninjected into\nsystem prompt"]
-    PM  --> Out3["Context string\ninjected into\nsystem prompt"]
-    UP  --> Out4["Context string\ninjected into\nsystem prompt"]
+    STM -->|"Optional[str]"| OUT["str or None"]
+    LTM -->|"Optional[str]"| Out2["str or None"]
+    PM  -->|"Optional[str]"| Out3["str or None"]
+    UP  -->|"Optional[str]"| Out4["str or None"]
 ```
 
 ---
@@ -333,12 +333,12 @@ flowchart TD
 #### `load_short_term_memory`
 
 ```python
-def load_short_term_memory(self, chat_id: int) -> str
+def load_short_term_memory(self, chat_id: int) -> Optional[str]
 ```
 
-Recent USER and AGENT turns as a plain-text transcript, **newest-first** (most recent turn at the top). Window size controlled by `tail_n` (default 12). Prefers `compressed_message` over raw `message`.
+Recent USER and AGENT turns as a plain-text transcript, oldest-first (chronological order). Window size controlled by `tail_n` (default 12). Prefers `compressed_message` over raw `message`.
 
-**Returns:** newline-joined `"Role: text"` pairs, or `"(none)"` if no records found.
+**Returns:** newline-joined `"Role: text"` pairs, or `None` if no records found.
 
 ```
 User: what was the ROP on NNM-101?
@@ -350,12 +350,12 @@ Ida: ROP averaged 18 m/hr across the 12¼" section.
 #### `load_long_term_memory`
 
 ```python
-def load_long_term_memory(self, chat_id: int) -> str
+def load_long_term_memory(self, chat_id: int) -> Optional[str]
 ```
 
 Current session's curated findings rendered as markdown from `chat.cheatsheet`. Written incrementally by CheatsheetAgent as the session progresses; fully settled ~40 min after the last exchange. `[CONFLICTED]` entries are prefixed automatically.
 
-**Returns:** markdown string, or `"(none)"` if the cheatsheet is empty or not yet written.
+**Returns:** markdown string, or `None` if the cheatsheet is empty or not yet written.
 
 ```
 **Data Insights:**
@@ -375,17 +375,17 @@ Current session's curated findings rendered as markdown from `chat.cheatsheet`. 
 #### `load_project_memory`
 
 ```python
-def load_project_memory(self, project_id: int, query: str) -> str
+def load_project_memory(self, project_id: int, query: str) -> Optional[str]
 ```
 
-FTS search over `agent_memory` (`scope=PROJECT`) — findings consolidated from prior sessions by ConsolidationAgent. Result count controlled by `top_k` (default 3). Does **not** filter by `memory_type` — `USER_PROFILE` entries can appear if they match the query. Use `load_user_profile` for an explicit profile read.
+FTS search over `agent_memory` (`scope=PROJECT`) — findings consolidated from prior sessions by ConsolidationAgent. Result count controlled by `top_k` (default 3).
 
 | Arg | Type | Description |
 |---|---|---|
 | `project_id` | `int` | Project to search within. |
 | `query` | `str` | Keywords or phrase; passed to PostgreSQL `plainto_tsquery` against `content_text`. |
 
-**Returns:** `"\n\n"`-joined formatted hits, or `"(none)"` if nothing matches.
+**Returns:** `"\n\n"`-joined formatted hits, or `None` if nothing matches.
 
 ```
 [data_insight] entity_nnm101
@@ -399,17 +399,17 @@ Well: NNM-101
 #### `load_user_profile`
 
 ```python
-def load_user_profile(self, user_id: int, project_id: int) -> str
+def load_user_profile(self, user_id: int, project_id: int) -> Optional[str]
 ```
 
 Per-project user profile from `agent_memory` (`scope=PROJECT`, keyed by `user_id`), written by HabitAgent after sessions go idle (~1 hour). One profile per `(user_id, project_id)` pair.
 
 | Arg | Type | Description |
 |---|---|---|
-| `user_id` | `int` | Must be non-zero; returns `"(none)"` otherwise. |
-| `project_id` | `int` | Must be non-zero; returns `"(none)"` otherwise. |
+| `user_id` | `int` | Must be non-zero; returns `None` otherwise. |
+| `project_id` | `int` | Must be non-zero; returns `None` otherwise. |
 
-**Returns:** `content_text` of the `user_profile` memory entry, or `"(none)"` for new users or before HabitAgent has first run.
+**Returns:** `content_text` of the `user_profile` memory entry, or `None` for new users or before HabitAgent has first run.
 
 ```
 QUERY STYLE: prefers concise answers with numeric precision
