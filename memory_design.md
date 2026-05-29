@@ -18,48 +18,119 @@ The design question is not *whether* to add memory. It is *what to remember, at 
 
 ## Classifying Memory for Agents
 
-Before choosing a technical approach, we need a vocabulary. Memory in cognitive science is typically divided into four types. We find this classification directly useful for agent design.
+Before choosing a technical approach, we need a shared vocabulary. Several industry frameworks have converged on a useful taxonomy. We review three, then show how IDA's design maps to and extends them.
+
+### Industry frameworks
+
+**Cognitive science (Tulving, 1972–1985).** The foundational model distinguishes three long-term memory types: *episodic* (memory of specific events), *semantic* (general knowledge about the world), and *procedural* (how to perform actions). These sit above *working memory* — the bounded active buffer for current reasoning. This model has held up remarkably well as a design framework for AI systems.
+
+**MemGPT / Letta (2023).** The first widely-cited agent memory architecture in the LLM era. Defines three stores: *core memory* (always in-context, like working memory + a persistent scratchpad), *recall memory* (searchable conversation history), and *archival memory* (unlimited external storage). Explicit context-window management with `memory_edit`, `recall_search`, and `archival_search` tools.
+
+**Generative Agents (Park et al., 2023).** Introduces the *memory stream* — a flat log of all observations — plus *retrieval* (recency + importance + relevance scoring), *reflection* (LLM synthesises higher-order insights from the stream), and *planning* (projecting intentions forward). The reflection mechanism — extracting durable insights from raw events — is the direct ancestor of our ConsolidationAgent.
+
+### How IDA maps to these frameworks
+
+```mermaid
+flowchart TB
+    subgraph COG ["Cognitive Science (Tulving)"]
+        direction LR
+        CWM["Working\nmemory"]
+        CEP["Episodic\nmemory"]
+        CSEM["Semantic\nmemory"]
+        CPROC["Procedural\nmemory"]
+    end
+
+    subgraph MG ["MemGPT / Letta"]
+        direction LR
+        CORE["Core memory\nalways in-context"]
+        RECALL["Recall memory\nsearchable history"]
+        ARCH["Archival memory\nexternal store"]
+    end
+
+    subgraph GA ["Generative Agents"]
+        direction LR
+        STREAM["Memory stream\nraw observations"]
+        REFL["Reflection\nhigher-order insights"]
+        PLAN["Planning\nforward projection"]
+    end
+
+    subgraph IDA ["IDA implementation"]
+        direction LR
+        CH["Chat history\nworking window"]
+        CSH["Session cheatsheet\nper-chat findings"]
+        PM["Project memory\nentity + facts + lessons"]
+        UP["User profile\nper-project style"]
+    end
+
+    CWM --> CH
+    CEP --> CSH
+    CSEM --> PM
+    CPROC --> UP
+
+    CORE --> CH
+    RECALL --> CSH
+    ARCH --> PM
+
+    STREAM --> CSH
+    REFL --> PM
+```
+
+| IDA class | Cognitive science | MemGPT / Letta | Generative Agents | Lifetime | Scope |
+|---|---|---|---|---|---|
+| **Chat history** | Working memory | Core memory | Memory stream (recent) | Session window | Per chat |
+| **Session cheatsheet** | Episodic memory | Recall memory | Memory stream (curated) | Per conversation | Per chat |
+| **Project memory** | Semantic memory | Archival memory | Reflection output | Persistent | Per project |
+| **User profile** | Procedural memory | Core memory (persona) | — | Persistent | Per user + project |
+
+### Where IDA extends the frameworks
+
+The three industry frameworks are designed for general-purpose agents. IDA adds two dimensions they do not address:
+
+**1. The trust axis.** No existing framework has a first-class concept of epistemic confidence per memory entry. Hermes, MemGPT, and Generative Agents all treat memory entries as equally trustworthy. For a domain-expert agent working with real engineering data, this is a critical gap.
+
+IDA introduces three confidence tiers:
+
+| Tier | Meaning | Promoted to permanent memory? |
+|---|---|---|
+| `verified` | Value appears verbatim in a tool result | Yes — all slots |
+| `inferred` | Agent's reasoned conclusion from context | Context and lessons only — not numeric facts |
+| `conflicted` | Same metric, two different values in data | Preserved in full; neither assertion promoted |
+
+This is the mechanism that keeps IDA from asserting unverified numbers as permanent facts. General-purpose agents can tolerate this ambiguity. A drilling engineer cannot.
+
+**2. Entity-keyed semantic memory.** General frameworks store semantic memory as flat text or embeddings — a bag of facts retrieved by similarity. IDA's semantic memory is structured around domain entities: `entity_nnm101`, `entity_nnm102`. Each well is a named slot that accumulates verified findings across sessions and merges them via LLM synthesis. This produces retrieval that is precise and structured, not probabilistically ranked.
+
+**3. Project-scoped procedural memory.** Hermes and MemGPT store user preferences globally. A user has one profile. IDA scopes procedural memory to `(user_id, project_id)` — because how an engineer works on a routine shallow well is not the same as on a complex HP/HT operation. This is an innovation over every existing framework we reviewed.
+
+**4. Memory consolidation as an explicit pipeline stage.** Generative Agents introduced *reflection* as LLM synthesis over raw events. IDA makes this a first-class pipeline stage: ConsolidationAgent reads the settled session cheatsheet and promotes findings to permanent memory through confidence filtering and LLM-mediated merging. The pipeline is staged, staggered, and auditable — not a background LLM call at random intervals.
+
+### The full classification
+
+Combining the cognitive model with IDA's two additional axes:
 
 ```mermaid
 flowchart LR
-    subgraph TYPES ["Memory types — cognitive model"]
-        WM["Working memory\nActive context window\nBounded, volatile"]
-        EP["Episodic\nWhat happened\nin past sessions"]
-        SEM["Semantic\nWhat is known\nabout the domain"]
-        PROC["Procedural\nHow to work\nwith this user"]
+    subgraph AXES ["Classification axes"]
+        direction TB
+        TYPE["Type\nWorking · Episodic\nSemantic · Procedural"]
+        SCOPE["Scope\nSession · Project · User"]
+        TRUST["Trust\nVerified · Inferred · Conflicted"]
     end
 
-    subgraph AGENT ["Agent implementation"]
-        CTX["Chat history\nlast N compressed exchanges"]
-        CS["Session cheatsheet\nstructured session findings"]
-        PM["Project memory\nverified entities, facts, lessons"]
-        UP["User profile\nper-project working style"]
+    subgraph CLASSES ["IDA memory classes"]
+        direction TB
+        CH["Chat history\nWorking · Session · —"]
+        CSH["Session cheatsheet\nEpisodic · Per-chat · All tiers"]
+        PM["Project memory\nSemantic · Project · Verified+Inferred"]
+        UP["User profile\nProcedural · Per-user+project · Inferred"]
     end
 
-    WM --> CTX
-    EP --> CS
-    SEM --> PM
-    PROC --> UP
+    TYPE --> CLASSES
+    SCOPE --> CLASSES
+    TRUST --> CLASSES
 ```
 
-| Cognitive type | What it holds | Agent implementation | Lifetime |
-|---|---|---|---|
-| **Working** | Active context — what we are reasoning about right now | Chat history window | Within session |
-| **Episodic** | What happened — specific past events and their outcomes | Session cheatsheet | Per conversation |
-| **Semantic** | What is known — distilled facts about the world | Project memory | Persistent, per project |
-| **Procedural** | How to act — learned patterns of effective behaviour | User profile | Persistent, per user + project |
-
-This classification drives our architecture directly. Each type has different **latency requirements** (working memory must be instant; semantic memory can be async), different **confidence requirements** (semantic facts must be verified; procedural patterns can be inferred from behaviour), and different **scope requirements** (procedural preferences are project-contextual, not global).
-
-### The additional axis: trust
-
-Beyond lifetime and scope, memory entries differ in epistemic status. Not all things an agent observes are equally trustworthy:
-
-- **Verified** — a value that appeared verbatim in a tool result. The database said so.
-- **Inferred** — a conclusion the agent reached by reasoning. Probably right.
-- **Conflicted** — the same metric appears with two different values. Neither is safe to assert.
-
-General-purpose memory systems ignore this axis entirely. For a domain-expert agent working with real engineering data, it is the most important axis of all.
+Each IDA memory class is fully described by all three axes. The trust axis is what makes the classification rigorous for a domain-expert agent rather than a general-purpose one.
 
 ---
 
