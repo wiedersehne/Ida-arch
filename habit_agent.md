@@ -18,12 +18,29 @@ This knowledge cannot be extracted reliably per-exchange. A single request for m
 
 ```mermaid
 flowchart LR
-    CR[("chat_record\nUSER + AGENT RESPONSE")]
-    HA["HabitAgent\n300s poll · session idle"]
-    UP[("agent_memory PROJECT\nuser_profile · user_id")]
-    MS["MemoryService\nload_user_profile"]
+    RS(["record_saved"])
 
-    CR --> HA --> UP --> MS
+    CC["ContextCompressor"]
+    CSA["CheatsheetAgent"]
+    CONS["ConsolidationAgent"]
+    HA["HabitAgent"]
+
+    CR[("chat_record\ncompressed_message")]
+    RAG[("rag_embeddings")]
+    CS[("chat.cheatsheet")]
+    AM[("agent_memory\nentity · facts · lessons")]
+    UP[("agent_memory\nuser_profile")]
+
+    MS(["MemoryService · tools"])
+
+    RS --> CC & CSA
+    CC --> CR & RAG
+    CR --> CSA & HA
+    CSA --> CS
+    CS --> CONS
+    CONS --> AM
+    HA --> UP
+    CR & RAG & CS & AM & UP --> MS
 
     style HA fill:#f9e4b7,stroke:#e6a817
 ```
