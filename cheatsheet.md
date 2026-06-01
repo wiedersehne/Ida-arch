@@ -1,533 +1,184 @@
-# Dynamic Cheatsheet System (DC-CU)
+# Cheatsheet
 
-## Overview
-
-The Dynamic Cheatsheet System implements a **Consult → Generate → Curate** (DC-CU) workflow to maintain adaptive, per-chat memory. Each chat maintains a curated cheatsheet containing:
-
-- **Knowledge Points**: Core concepts, facts, and domain-specific information
-- **Data Insights**: Important insights from data analysis (cost analysis, NPT analysis, progress analysis, etc.)
-- **Errors & Lessons**: Mistakes encountered and how they were resolved
-
-The cheatsheet is **shared across all agents** in the same chat, enabling knowledge transfer and consistency.
+**Location:** `backend/app/agents/workers/cheatsheet_agent.py`, `backend/app/services/cheatsheet/`
 
 ---
 
-## Architecture
+## Motivation
 
-### System Components
+The memory design needs a session-scoped layer between raw conversation history and persistent project memory. Raw history is authoritative but too large and unstructured to inject as context; persistent project memory is cross-session but too coarse to reflect what has been established within the current conversation.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Dynamic Cheatsheet System                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────────┐         ┌──────────────────┐            │
-│  │ CheatsheetService│         │ DynamicCheatsheet │            │
-│  │  (Service Layer) │────────▶│   (Core Logic)   │            │
-│  └──────────────────┘         └──────────────────┘            │
-│         │                              │                        │
-│         │                              │                        │
-│         ▼                              ▼                        │
-│  ┌──────────────────┐         ┌──────────────────┐            │
-│  │   Agents         │         │  ProjectService  │            │
-│  │  (SME, DataInsight│         │  (Database)      │            │
-│  │   ReportGen, Viz)│         │  chat.playbook   │            │
-│  └──────────────────┘         └──────────────────┘            │
-│         │                                                       │
-│         │                                                       │
-│         ▼                                                       │
-│  ┌──────────────────┐                                          │
-│  │ CheatsheetAgent │                                          │
-│  │ (Continuous)    │                                          │
-│  └──────────────────┘                                          │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+Without a session layer, agents lose access to findings made earlier in the same session once those turns scroll out of the short-term window. They also have nothing structured to consolidate — `ConsolidationAgent` cannot promote findings to `agent_memory` if the only source is an unbounded transcript.
 
-### Component Responsibilities
-
-1. **`DynamicCheatsheet`**: Core class implementing DC-CU workflow
-   - `consult()`: Loads cheatsheet from database
-   - `generate()`: Generates answer using cheatsheet (optional, agents can use their own prompts)
-   - `curate()`: Updates cheatsheet based on exchange
-
-2. **`CheatsheetService`**: Service layer providing easy access for agents
-   - `get_cheatsheet()`: Retrieves current cheatsheet
-   - `update_cheatsheet()`: Updates cheatsheet after exchange
-
-3. **`CheatsheetAgent`**: Continuous background agent
-   - Automatically detects new chat exchanges
-   - Updates cheatsheets without manual intervention
-
-4. **Storage**: `chat.playbook` field in database
-   - One cheatsheet per chat (shared across all agents)
-   - Persisted as plain text string
+The cheatsheet is that session layer: a compact, typed record of confirmed findings maintained incrementally as the conversation progresses. It gives agents access to earlier-session knowledge without injecting the full history, and it gives `ConsolidationAgent` a consolidation-ready artifact at session end.
 
 ---
 
-## DC-CU Workflow
+## Role in the Memory Pipeline
 
-### Consult → Generate → Curate Cycle
+`CheatsheetAgent` is the second capture stage. It fires after `ContextCompressor` has indexed and optionally compressed new records, reads each agent response, and updates the per-chat cheatsheet.
 
 ```mermaid
-graph TD
-    A[User Query] --> B[CONSULT Phase]
-    B --> C[Load Cheatsheet from chat.playbook]
-    C --> D[GENERATE Phase]
-    D --> E[Agent Uses Cheatsheet in System Prompt]
-    E --> F[Agent Generates Answer]
-    F --> G[CURATE Phase]
-    G --> H[CheatsheetAgent Detects Exchange]
-    H --> I[Extract Knowledge/Data/Errors]
-    I --> J[Update Cheatsheet]
-    J --> K[Save to chat.playbook]
-    K --> L[Next Query]
-    L --> B
-    
-    style B fill:#e1f5ff
-    style D fill:#fff4e1
-    style G fill:#e8f5e9
+flowchart LR
+    RS(["system.historian\nrecord_saved"])
+
+    RS --> CC["ContextCompressor"]
+    RS --> CSA["CheatsheetAgent\nAGENT RESPONSE only"]
+
+    CC --> CR[("chat_record\n.compressed_message")]
+    CR --> CSA
+
+    CSA --> CS[("chat.cheatsheet\nper-chat JSON")]
+
+    CS --> CONS["ConsolidationAgent\npromotes to agent_memory"]
+    CS --> MS["MemoryService\nload_long_term_memory"]
+    CS --> TOOL["tool_read_long_term_memory"]
+
+    CONS --> AM[("agent_memory PROJECT")]
+    AM --> MS
+
+    style CSA fill:#f9e4b7,stroke:#e6a817
 ```
 
-### Detailed Flow
-
-#### 1. CONSULT Phase
-
-When an agent receives a user query:
-
-```python
-# Agent retrieves cheatsheet
-cheatsheet = cheatsheet_service.get_cheatsheet(chat_id, project_id)
-# Returns: "(empty)" or current cheatsheet content
-```
-
-**Storage Location**: `chat.playbook` field in database
-
-#### 2. GENERATE Phase
-
-Agent injects cheatsheet into system prompt:
-
-```python
-system_message += f"""
----
-CHEATSHEET (Main knowledge points, All Data Insights from previous exchanges):
-{cheatsheet}
----
-
-CRITICAL: Use the Main knowledge points and All Data Insights from the cheatsheet 
-to guide your tool selection and responses when applicable. Some questions might 
-be answered with cheatsheet only without using tools.
-"""
-```
-
-Agent then generates answer using tools and LLM.
-
-#### 3. CURATE Phase
-
-**Automatic (via CheatsheetAgent)**:
-- `CheatsheetAgent` runs continuously in background
-- Detects new agent responses
-- Finds preceding user query
-- Calls `cheatsheet_service.update_cheatsheet()`
-
-**Process**:
-1. Load current cheatsheet
-2. Send exchange (user query + agent answer) to curator LLM
-3. Curator extracts:
-   - Knowledge Points
-   - Data Insights (e.g., "Cost for NNM102 is $869,982.00")
-   - Errors & Lessons
-4. Compress and consolidate with previous cheatsheet
-5. Save updated cheatsheet to `chat.playbook`
+`chat.cheatsheet` is consumed by three downstream stages:
+- `MemoryService.load_long_term_memory` — injected into every system prompt as session context
+- `tool_read_long_term_memory` — on-demand access during agent reasoning
+- `ConsolidationAgent` — source for promoting verified findings to persistent project memory
 
 ---
 
-## Cheatsheet Content Structure
+## Schema
 
-### Format
+The cheatsheet is a JSON blob stored on the `chat` row. Three typed buckets:
 
-```markdown
-### Knowledge Points
-- [Core concepts, facts, and domain-specific information]
-- [All previous knowledge points preserved and compressed]
-
-### Data Insights
-- [Important insights from data analysis]
-- [Specific well data: "Cost for NNM102 is $869,982.00"]
-- [Analysis results: trends, metrics, findings]
-
-### Errors & Lessons
-- [Errors encountered and how they were resolved]
-- [Lessons learned from mistakes]
-```
-
-### Example Cheatsheet
-
-```markdown
-### Knowledge Points
-- ROP (Rate of Penetration) measures feet per hour of downhole drilling progress, distinct from surface speed
-- Cost analysis evaluates drilling expenses and budget performance
-
-### Data Insights
-- Cost for NNM102 is $869,982.00 total, with average daily cost of $289,994.00 (3 days of data)
-- NPT for NNM101 is 100 hours and caused 1million USD of cost
-- The drilling depth for NNM101 is 1000 meters and the ROP is 10 meters per hour
-
-### Errors & Lessons
-- Confusion between ROP and surface speed - always clarify which metric is being discussed
-```
-
----
-
-## Agent Integration
-
-### How Agents Use Cheatsheet
-
-All agents (SME, DataInsight, ReportGenerator, Viz) follow the same pattern:
-
-```python
-class MyAgent(AgentBase):
-    def __init__(self, ..., cheatsheet_service: Optional[CheatsheetService] = None):
-        self.cheatsheet_service = cheatsheet_service
-    
-    def tool_orchestrator(self, state):
-        # CONSULT: Get cheatsheet
-        cheatsheet = "(empty)"
-        if self.cheatsheet_service and self.chat_id and self.project_id:
-            cheatsheet = self.cheatsheet_service.get_cheatsheet(
-                chat_id=self.chat_id,
-                project_id=self.project_id,
-            )
-        
-        # Inject into system message
-        if cheatsheet and cheatsheet != "(empty)":
-            system_message += f"""
----
-CHEATSHEET (Main knowledge points, All Data Insights):
-{cheatsheet}
----
-CRITICAL: Use the cheatsheet to guide your responses...
-"""
-        
-        # Agent generates answer using tools and LLM
-        # (CheatsheetAgent automatically updates cheatsheet in background)
-```
-
-### Integration Points
-
-```mermaid
-graph LR
-    A[User Query] --> B[Agent Receives Query]
-    B --> C[Agent Calls get_cheatsheet]
-    C --> D[CheatsheetService]
-    D --> E[Load from chat.playbook]
-    E --> F[Return to Agent]
-    F --> G[Agent Injects in System Prompt]
-    G --> H[Agent Generates Answer]
-    H --> I[Agent Sends Answer]
-    I --> J[CheatsheetAgent Detects Exchange]
-    J --> K[CheatsheetAgent Calls update_cheatsheet]
-    K --> L[Curator LLM Extracts Info]
-    L --> M[Save Updated Cheatsheet]
-    
-    style C fill:#e1f5ff
-    style K fill:#e8f5e9
-```
-
----
-
-## Automatic Maintenance (CheatsheetAgent)
-
-### How It Works
-
-`CheatsheetAgent` is a **continuous agent** that runs in the background:
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Agent as Production Agent
-    participant DB as Database
-    participant CA as CheatsheetAgent
-    
-    User->>Agent: Query
-    Agent->>DB: Load cheatsheet
-    DB-->>Agent: Current cheatsheet
-    Agent->>Agent: Generate answer (with cheatsheet)
-    Agent->>User: Answer
-    
-    Note over CA: Polling for new exchanges
-    CA->>DB: Check for new agent responses
-    DB-->>CA: New agent response found
-    CA->>DB: Find preceding user query
-    DB-->>CA: User query
-    CA->>CA: Extract knowledge/data/errors
-    CA->>DB: Save updated cheatsheet
-```
-
-### Processing Logic
-
-1. **Polling**: Checks for new agent responses every `poll_interval` seconds (default: 10s)
-2. **Exchange Detection**: Finds user query that preceded each agent response
-3. **Update**: Calls `cheatsheet_service.update_cheatsheet()` with:
-   - User query
-   - Agent answer
-   - Current cheatsheet
-4. **Tracking**: Uses in-memory tracking to avoid reprocessing same exchanges
-
-### State Tracking
-
-- **In-Memory**: `_processed_records: Dict[tuple[int, int], int]`
-  - Key: `(chat_id, project_id)`
-  - Value: Last processed `record_id`
-- **No Persistent State**: Resets on agent restart (processes from beginning)
-
----
-
-## Curator Prompt
-
-The curator LLM extracts information using `CURATOR_PROMPT`:
-
-### What Gets Extracted
-
-1. **Knowledge Points**:
-   - Core concepts, principles, theories
-   - Key facts and important context
-
-2. **Data Insights**:
-   - Analysis results (cost, NPT, progress)
-   - Specific well data (e.g., "Cost for NNM102 is $869,982.00")
-   - Important file names or well names
-   - Key metrics, trends, anomalies
-
-3. **Errors & Lessons**:
-   - Tool failures, incorrect assumptions
-   - How errors were resolved
-   - Lessons learned
-
-### Update Strategy
-
-- **Always preserve** previous cheatsheet content
-- **Compress and consolidate** when adding new information
-- **Incremental updates only** - never replace entire cheatsheet
-- **Extract from informative exchanges** - skip trivial exchanges
-
-### Output Format
-
-Curator LLM must wrap response in `<cheatsheet>...</cheatsheet>` tags:
-
-```xml
-<cheatsheet>
-### Knowledge Points
-- [Updated content]
-
-### Data Insights
-- [Updated content]
-
-### Errors & Lessons
-- [Updated content]
-</cheatsheet>
-```
-
----
-
-## Generator Prompt
-
-The generator prompt (`GENERATOR_PROMPT`) guides agents on how to use the cheatsheet:
-
-### Key Sections
-
-1. **Analysis & Strategy**: Analyze question and cheatsheet, identify patterns
-2. **Solution Development**: Present clear, logical steps
-3. **Tool Usage & Data Analysis**: Guidelines for using tools
-4. **Response Format**: Clear, comprehensive answers
-
-### Placeholders
-
-- `[[QUESTION]]`: User's query
-- `[[CHEATSHEET]]`: Current cheatsheet content
-
-**Note**: Agents typically use their own prompts and inject the cheatsheet directly, rather than using the generator prompt template.
-
----
-
-## Storage
-
-### Database Schema
-
-```python
-class Chat(Base):
-    id: int
-    project_id: int
-    playbook: str  # Cheatsheet stored here
-    # ... other fields
-```
-
-### Persistence Flow
-
-```mermaid
-graph LR
-    A[CheatsheetAgent] --> B[update_cheatsheet]
-    B --> C[DynamicCheatsheet.curate]
-    C --> D[Curator LLM]
-    D --> E[Extract Updated Cheatsheet]
-    E --> F[DynamicCheatsheet.save]
-    F --> G[ProjectService.update_chat_playbook]
-    G --> H[Database: chat.playbook]
-    
-    style H fill:#fff4e1
-```
-
----
-
-## Key Design Decisions
-
-### 1. One Cheatsheet Per Chat
-
-- **Rationale**: Knowledge is shared across all agents in a conversation
-- **Benefit**: Agents learn from each other's exchanges
-- **Storage**: `chat.playbook` field
-
-### 2. Automatic Maintenance
-
-- **Rationale**: Eliminates need for agents to manually call `update_cheatsheet()`
-- **Implementation**: `CheatsheetAgent` as continuous background service
-- **Benefit**: Consistent updates, no code changes needed in production agents
-
-### 3. Service-Based Architecture
-
-- **Rationale**: Easy dependency injection, testable, modular
-- **Components**: `CheatsheetService` → `DynamicCheatsheet` → `ProjectService`
-- **Benefit**: Agents only need `CheatsheetService`, not full implementation
-
-### 4. Category-Based Organization
-
-- **Structure**: Knowledge Points, Data Insights, Errors & Lessons
-- **Rationale**: Clear separation, easy to find relevant information
-- **Not Agent-Wise**: Unified structure regardless of which agent generated the content
-
----
-
-## Usage Examples
-
-### Example 1: Cost Analysis Exchange
-
-**User Query**: "Show cost analysis for well NNM102"
-
-**Agent Answer**: 
-```
-## 💰 Cost Analysis for Well NNM102
-Total Cost: $869,982.00
-Average Daily Cost: $289,994.00
-3 days of data available...
-```
-
-**Curator Extracts**:
-```markdown
-### Data Insights
-- Cost for NNM102 is $869,982.00 total, with average daily cost of $289,994.00 (3 days of data)
-- Well NNM102 cost analysis shows consistent daily costs with slight increase on last day
-```
-
-### Example 2: Knowledge Exchange
-
-**User Query**: "What is the difference between ROP and drilling speed?"
-
-**Agent Answer**: "ROP (Rate of Penetration) measures feet per hour drilled. I initially confused it with surface speed, but they're different - ROP is downhole progress."
-
-**Curator Extracts**:
-```markdown
-### Knowledge Points
-- ROP measures feet per hour of downhole drilling progress, distinct from surface speed
-
-### Errors & Lessons
-- Confusion between ROP and surface speed - always clarify which metric is being discussed
-```
-
----
-
-## Configuration
-
-### CheatsheetAgent Settings
-
-In `agent_config`:
 ```json
 {
-  "poll_interval": 10  // Seconds between polling cycles
+  "data_insights":   [{"content": "NPT: 54.2 hrs (12.1%)", "confidence": "verified", "entity": "NNM-101", "record_id": 847}],
+  "key_facts":       [{"id": "kf_3a1b2c", "content": "WellView export truncated at 3200m", "confidence": "inferred", "record_id": 801}],
+  "lessons_learned": [{"id": "ll_9f8e7d", "content": "Pre-treat with LCM before depleted zones", "confidence": "inferred", "entity": "NNM-101"}]
 }
 ```
 
-### LLM Models
+| Bucket | Contents | Keyed by |
+|---|---|---|
+| `data_insights` | Per-entity numeric findings: NPT, ROP, depth, cost | `entity` + metric — no stable `id` |
+| `key_facts` | Data quality gaps, user knowledge gaps, workflow context | Stable `id` (`kf_*`) |
+| `lessons_learned` | Actionable operational insights | Stable `id` (`ll_*`) |
 
-- **Generator LLM**: `LLMModelType.MICRO_SMART` (for `generate()` method, rarely used)
-- **Curator LLM**: `LLMModelType.MICRO_SMART` (for extracting and updating cheatsheet)
+**Confidence model:**
 
----
+| Value | Meaning |
+|---|---|
+| `verified` | Value appears verbatim in a tool result block |
+| `inferred` | Derived from agent narrative, not a tool result |
+| `conflicted` | Same entity + metric has two different values; both entries preserved |
 
-## Troubleshooting
-
-### Cheatsheet Not Updating
-
-1. **Check CheatsheetAgent is running**: Look for logs like "CheatsheetAgent is running"
-2. **Check exchange detection**: Verify user query is found before agent response
-3. **Check curator response**: Curator LLM must return `<cheatsheet>...</cheatsheet>` tags
-4. **Check database**: Verify `chat.playbook` is being updated
-
-### Disabling Cheatsheet
-
-To disable for testing:
-
-1. **Comment out CheatsheetAgent** in `backend/app/agents/factory/registry.py`:
-   ```python
-   # AGENT_CLASSES = [..., CheatsheetAgent, ...]
-   ```
-
-2. **Disable CheatsheetService** in `backend/app/cheatsheet/cheatsheet_service.py`:
-   ```python
-   def get_cheatsheet(self, chat_id: int, project_id: int) -> str:
-       return "(empty)"  # Always return empty
-   
-   def update_cheatsheet(self, ...):
-       return  # Do nothing
-   ```
+`data_insights` entries are keyed by entity + metric — the curator updates them in-place. `key_facts` and `lessons_learned` entries carry a stable `id` stamped by `CheatsheetService`, never by the LLM, enabling in-place updates (Replace) and removals (Delete) across turns without duplication.
 
 ---
 
-## Files Reference
+## Implementation
 
-### Core Files
+### Trigger
 
-- `backend/app/cheatsheet/cheatsheet.py`: `DynamicCheatsheet` class
-- `backend/app/cheatsheet/cheatsheet_service.py`: `CheatsheetService` class
-- `backend/app/agents/workers/cheatsheet_agent.py`: Continuous agent for automatic updates
-- `backend/app/cheatsheet/cheatsheet_curator_prompt.py`: Curator prompt template
-- `backend/app/cheatsheet/cheatsheet_generator_prompt.py`: Generator prompt template
+`CheatsheetAgent` subscribes to `system.historian.record_saved` and fires only on AGENT RESPONSE records (`sender_role=AGENT`, `msg_type=RESPONSE`). A 120-second fallback poll covers records missed across restarts.
 
-### Agent Integration
+Each eligible event spawns a per-chat thread. If a new response arrives while a thread is already running for the same chat, the chat is marked in `_dirty_chats` and the thread re-submits itself on exit. No events are dropped.
 
-- `backend/app/agents/workers/subject_matter_expert.py`: SME agent integration
-- `backend/app/agents/workers/datainsight.py`: DataInsight agent integration
-- `backend/app/agents/workers/report_generator.py`: ReportGenerator agent integration
-- `backend/app/agents/workers/viz_agent.py`: Viz agent integration
+```mermaid
+flowchart TD
+    EV(["record_saved event"]) --> CB["_on_new_response\nfilter: AGENT RESPONSE only"]
+    CB --> ACTIVE{chat in\n_active_chats?}
+    ACTIVE -- Yes --> DIRTY["mark _dirty_chats"]
+    ACTIVE -- No --> SUBMIT["add to _active_chats\nsubmit _process_chat thread"]
 
-### Database
+    SUBMIT --> LOOP["_get_next_record\ntail window logic"]
+    LOOP --> REC{record\neligible?}
+    REC -- No --> EXIT
+    REC -- Yes --> CURATE["_curate_record\nCheatsheetService.update_cheatsheet"]
+    CURATE --> ADVANCE["advance cheatsheet_cursor_ts"]
+    ADVANCE --> LOOP
 
-- `backend/app/db/project.py`: `ProjectService.update_chat_playbook()` method
+    EXIT --> REDIRTY{in _dirty_chats?}
+    REDIRTY -- Yes --> RESUBMIT["discard dirty flag\nre-submit thread"]
+    REDIRTY -- No --> DONE(["remove from _active_chats"])
+```
+
+### Tail window
+
+The cheatsheet is a curated summary, not a log. Curating every exchange as it arrives would produce a cheatsheet biased toward the most recent turn and miss the broader pattern. The tail window defers curation of recent exchanges until enough context has accumulated.
+
+```mermaid
+flowchart TD
+    A["_get_next_record\ntail_n = tail_window_size"] --> B["fetch oldest tail_n+1\nunprocessed AGENT RESPONSE records"]
+    B --> C{unprocessed\ncount > tail_n?}
+    C -- Yes --> PHASE3["Phase 3 — sliding window\noldest has left the tail\ncurate immediately"]
+
+    C -- No --> D["fetch most recent tail_n+1\nall AGENT RESPONSE records"]
+    D --> E{total\n<= tail_n?}
+    E -- Yes --> PHASE1["Phase 1 — young chat\ncurate immediately"]
+
+    E -- No --> F{idle >\n40 min?}
+    F -- Yes --> IDLE["Idle bypass\nflush remaining tail"]
+    F -- No --> PHASE2["Phase 2 — accumulating\ndefer until tail fills"]
+```
+
+| Phase | Condition | Action |
+|---|---|---|
+| **1 — young** | total records ≤ `tail_n` | Curate each exchange immediately |
+| **2 — accumulating** | total > `tail_n`, unprocessed ≤ `tail_n` | Defer — wait for the tail to fill |
+| **3 — sliding window** | unprocessed > `tail_n` | Oldest unprocessed has left the tail — curate immediately |
+| **Idle bypass** | last response > 40 min ago | Flush all remaining tail records regardless of phase |
+
+Default `tail_n`: **6**. Configurable via `agent_config["tail_window_size"]`.
+
+The 40-minute idle bypass is what allows `ConsolidationAgent` (which fires at 60 minutes idle) to always read a fully settled cheatsheet.
+
+### Curation
+
+`CheatsheetService.update_cheatsheet` runs one LLM call per eligible exchange:
+
+1. Load current `chat.cheatsheet` JSON (or `{}` if empty)
+2. LLM call with `[user_query, agent_response, current_cheatsheet]` → updated cheatsheet JSON
+3. Parse and validate with `parse_cheatsheet`; if unparseable, keep previous cheatsheet
+4. Stamp stable `id` on new `key_facts` and `lessons_learned` entries (`kf_*`, `ll_*`)
+5. Stamp `record_id` on all new entries; existing entries carry their `record_id` forward
+6. Save via `project_service.save_chat_cheatsheet`
+7. Advance `cheatsheet_cursor_ts`
+
+The curator reads `record.compressed_message or record.message` — it uses the compressor's summary when available.
+
+Model: `CONTEXT_MASTER`. Curation requires understanding the full exchange in context of the existing cheatsheet; a reasoning-capable model is appropriate here.
+
+### Cursor
+
+`cheatsheet_cursor_ts` is a per-chat timestamp column on the `chat` row. It advances to the processed record's timestamp after each successful curation. The fallback poll queries for chats where the most recent AGENT RESPONSE is newer than `cheatsheet_cursor_ts`.
 
 ---
 
-## Future Enhancements
+## Consumption
 
-Potential improvements:
+### `MemoryService.load_long_term_memory`
 
-1. **Semantic Search**: Retrieve relevant cheatsheet sections based on query similarity
-2. **Cheatsheet Compression**: Automatic compression when cheatsheet exceeds token limits
-3. **Version History**: Track cheatsheet changes over time
-4. **Cross-Chat Learning**: Share insights across chats (with user permission)
-5. **Validation**: Verify extracted information before adding to cheatsheet
+```python
+raw = self._project_service.get_chat_cheatsheet(chat_id)
+result = render_to_markdown(parse_cheatsheet(raw))
+```
 
----
+Rendered as markdown and injected into every system prompt. All session findings — from turn 1 to the current turn — are available to the agent in ~2 KB regardless of session length. Conflicted entries are prefixed `[CONFLICTED]` so the agent knows the value is contested.
 
-## References
+### `ConsolidationAgent`
 
-- **DC-CU Paper**: Dynamic Cheatsheet with Consult → Generate → Curate workflow
-- **Implementation**: Based on simplified string-based approach with template-driven prompts
+Reads `chat.cheatsheet` after the session goes idle (60 min) or the cursor gap exceeds 3 hours. Promotes entries by confidence filter:
+
+| Bucket | Filter | Target |
+|---|---|---|
+| `data_insights` | `confidence == "verified"` | `entity_{key}` in `agent_memory` |
+| `key_facts` | `confidence in ("verified", "inferred")` | `project_facts` in `agent_memory` |
+| `lessons_learned` | all entries | `project_lessons` in `agent_memory` |
+
+The cheatsheet is the only input `ConsolidationAgent` reads — no direct access to `chat_record`.
+
+### `tool_read_long_term_memory`
+
+On-demand tool available during agent reasoning. Returns the same `render_to_markdown` output as `load_long_term_memory`. Used when an agent needs to re-check session findings mid-chain without relying on what was injected at prompt build time.
