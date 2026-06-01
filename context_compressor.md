@@ -16,38 +16,38 @@ The memory design also requires that the full conversation history be retrievabl
 
 ## Role in the Memory Pipeline
 
-`ContextCompressor` is the first agent in the capture pipeline. It fires on every new USER and AGENT message — earlier than `CheatsheetAgent` (AGENT RESPONSE only) and far earlier than `ConsolidationAgent` (idle poll).
+`ContextCompressor` is the first capture stage. It fires on every USER and AGENT record — earlier than `CheatsheetAgent` (AGENT RESPONSE only) and far earlier than `ConsolidationAgent` and `HabitAgent` (idle poll).
 
 ```mermaid
 flowchart LR
-    RS(["system.historian\nrecord_saved"])
+    RS(["record_saved"])
 
-    RS --> CC["ContextCompressor\n① embed into RAG\n② compress if long"]
-    RS --> CSA["CheatsheetAgent\nreads compressed_message\nor message"]
+    CC["ContextCompressor"]
+    CSA["CheatsheetAgent"]
+    CONS["ConsolidationAgent"]
+    HA["HabitAgent"]
 
-    CC --> RAG[("rag_embeddings")]
-    CC --> CR[("chat_record\n.compressed_message")]
+    CR[("chat_record\ncompressed_message")]
+    RAG[("rag_embeddings")]
+    CS[("chat.cheatsheet")]
+    AM[("agent_memory\nentity · facts · lessons")]
+    UP[("agent_memory\nuser_profile")]
 
-    CSA --> CS[("chat.cheatsheet")]
-    CS --> CONS["ConsolidationAgent"]
-    CONS --> AM[("agent_memory PROJECT")]
+    MS(["MemoryService · tools"])
 
-    CR --> MS["MemoryService\nload_short_term_memory"]
-    CR --> CSA
-
-    RAG --> TOOL["tool_search_chat_history"]
-    AM --> MS
+    RS --> CC & CSA
+    CC --> CR & RAG
+    CR --> CSA & HA
+    CSA --> CS
+    CS --> CONS
+    CONS --> AM
+    HA --> UP
+    CR & RAG & CS & AM & UP --> MS
 
     style CC fill:#d4edda,stroke:#28a745
 ```
 
-`compressed_message` is consumed by two downstream stages:
-- `MemoryService.load_short_term_memory` — bounds context cost per turn
-- `CheatsheetAgent._curate_record` — cleaner curation input
-
-`rag_embeddings` is consumed by `tool_search_chat_history` — the only path for retrieving turns that have scrolled past the short-term window.
-
-Both consumers use `compressed_message or message` — they degrade gracefully if the compressor has not yet run.
+`compressed_message` is consumed by `CheatsheetAgent` (cleaner curation input) and `MemoryService.load_short_term_memory` (bounded context cost per turn). `rag_embeddings` is consumed by `tool_search_chat_history` — the only path for retrieving turns beyond the short-term window. Both consumers use `compressed_message or message` and degrade gracefully if the compressor has not yet run.
 
 ---
 
