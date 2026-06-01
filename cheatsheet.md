@@ -6,11 +6,9 @@
 
 ## Motivation
 
-The memory design needs a session-scoped layer between raw conversation history and persistent project memory. Raw history is authoritative but too large and unstructured to inject as context; persistent project memory is cross-session but too coarse to reflect what has been established within the current conversation.
+Within a session, the agent needs to remember what was established in earlier turns. The short-term window covers only the tail of the conversation — findings confirmed in turn 3 are gone from context by turn 15. Injecting the full transcript is not a solution: it grows without bound and is dominated by reasoning steps, tool outputs, and intermediate text that carry no durable signal.
 
-Without a session layer, agents lose access to findings made earlier in the same session once those turns scroll out of the short-term window. They also have nothing structured to consolidate — `ConsolidationAgent` cannot promote findings to `agent_memory` if the only source is an unbounded transcript.
-
-The cheatsheet is that session layer: a compact, typed record of confirmed findings maintained incrementally as the conversation progresses. It gives agents access to earlier-session knowledge without injecting the full history, and it gives `ConsolidationAgent` a consolidation-ready artifact at session end.
+What is needed is a representation that accumulates only the confirmed findings — stripped of the surrounding conversation — and stays compact regardless of how long the session runs. The cheatsheet is that representation: a typed, incrementally updated record of verified data points, data quality observations, and operational insights, injected at bounded cost into every subsequent turn.
 
 ---
 
