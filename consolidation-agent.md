@@ -18,22 +18,34 @@ Many of those findings are durable: a confirmed NPT figure for NNM-101 does not 
 
 ```mermaid
 flowchart LR
-    CS[("chat.cheatsheet\nper-chat · ephemeral")]
-    CONS["ConsolidationAgent\n300s poll · idle or cursor gap"]
-    AM[("agent_memory PROJECT\npersistent · cross-session")]
-    MS["MemoryService\nload_project_memory"]
-    TOOL["tool_read_project_memory"]
+    RS(["record_saved"])
 
-    CS --> CONS --> AM
-    AM --> MS
-    AM --> TOOL
+    CC["ContextCompressor"]
+    CSA["CheatsheetAgent"]
+    CONS["ConsolidationAgent"]
+    HA["HabitAgent"]
+
+    CR[("chat_record\ncompressed_message")]
+    RAG[("rag_embeddings")]
+    CS[("chat.cheatsheet")]
+    AM[("agent_memory\nentity · facts · lessons")]
+    UP[("agent_memory\nuser_profile")]
+
+    MS(["MemoryService · tools"])
+
+    RS --> CC & CSA
+    CC --> CR & RAG
+    CR --> CSA & HA
+    CSA --> CS
+    CS --> CONS
+    CONS --> AM
+    HA --> UP
+    CR & RAG & CS & AM & UP --> MS
 
     style CONS fill:#f9e4b7,stroke:#e6a817
 ```
 
-`agent_memory PROJECT` is consumed by:
-- `MemoryService.load_project_memory` — injected into the system prompt at the start of each session
-- `tool_read_project_memory` — on-demand retrieval during agent reasoning
+`agent_memory PROJECT` is consumed by `MemoryService.load_project_memory` (injected into the system prompt at session start) and `tool_read_project_memory` (on-demand retrieval during reasoning).
 
 ---
 
