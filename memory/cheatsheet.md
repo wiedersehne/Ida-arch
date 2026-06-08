@@ -45,7 +45,7 @@ flowchart LR
     style CSA fill:#f9e4b7,stroke:#e6a817
 ```
 
-`chat.cheatsheet` is consumed by `MemoryService.load_long_term_memory` (injected into every system prompt), `tool_read_long_term_memory` (on-demand during reasoning), and `ConsolidationAgent` (source for cross-session promotion).
+`chat.cheatsheet` is consumed by the sub-agents via `CheatsheetService.get_cheatsheet` (tail-filtered, appended to their system prompt), `MemoryService.load_long_term_memory` and `tool_read_long_term_memory` (full render, on-demand during reasoning), and `ConsolidationAgent` (source for cross-session promotion). See [Consumption](#consumption).
 
 ---
 
@@ -76,6 +76,12 @@ The cheatsheet is a JSON blob stored on the `chat` row. Three typed buckets:
 | `conflicted` | Same entity + metric has two different values; both entries preserved |
 
 `data_insights` entries are keyed by entity + metric — the curator updates them in-place. `key_facts` and `lessons_learned` entries carry a stable `id` stamped by `CheatsheetService`, never by the LLM, enabling in-place updates (Replace) and removals (Delete) across turns without duplication.
+
+Every entry also carries a `record_id` (the `chat_record.id` of the agent response it was distilled from), stamped by `CheatsheetService`. Besides letting the curator detect conflicts against existing entries, `record_id` drives tail filtering on read (see [Tail filtering on read](#tail-filtering-on-read)).
+
+`user_habits` are intentionally **absent** from the schema — `HabitAgent` owns per-session habit learning at session end, where the full-session view it needs is available (per-exchange extraction is unreliable).
+
+The data is stored on `chat.cheatsheet` as a JSON string via `CheatsheetData.to_storage_json()`, which excludes the transient `legacy_text` field. A pre-migration plain-text cheatsheet is read back into `CheatsheetData.legacy_text` and rendered verbatim, so old chats keep working without a data migration.
 
 ---
 
@@ -132,23 +138,33 @@ flowchart TD
 | **3 — sliding window** | unprocessed > `tail_n` | Oldest unprocessed has left the tail — curate immediately |
 | **Idle bypass** | last response > 40 min ago | Flush all remaining tail records regardless of phase |
 
-Default `tail_n`: **6**. Configurable via `agent_config["tail_window_size"]`.
+`tail_n` is fixed at **6** by the `TAIL_WINDOW_SIZE` constant in `cheatsheet_service.py`. This is a single source of truth, **not** an agent-config knob: the curation side (`CheatsheetAgent`) and the injection side (`CheatsheetService.get_cheatsheet`) must use the same boundary, and the consumers that inject the cheatsheet build their own `CheatsheetService` and cannot see the agent's config. The agent imports the constant rather than defining its own copy.
 
 The 40-minute idle bypass is what allows `ConsolidationAgent` (which fires at 60 minutes idle) to always read a fully settled cheatsheet.
+
+### Tail filtering on read (the second SCD2 boundary)
+
+The tail window has two matched halves around the same `TAIL_WINDOW_SIZE` boundary:
+
+- **Curation side** — `CheatsheetAgent` leaves the most recent `TAIL_WINDOW_SIZE` agent responses uncurated (the phases above).
+- **Injection side** — when the cheatsheet is rendered for context, entries distilled from those same recent records are hidden, because those exchanges are still present verbatim in the raw chat history already in the prompt. Surfacing them again would duplicate signal.
+
+The mechanism: `CheatsheetService.get_cheatsheet` computes `_get_tail_start_record_id(chat_id)` — the oldest `record_id` among the last `TAIL_WINDOW_SIZE` agent RESPONSE records — and passes it to `DynamicCheatsheet.consult` as `min_record_id`. `render_to_markdown` then drops any entry whose `record_id >= min_record_id`. Entries with no `record_id` (e.g. legacy or unstamped) are always shown.
+
+The two boundaries stay aligned because both derive from the one `TAIL_WINDOW_SIZE`: a record is either inside the tail (uncurated, but in raw history) or outside it (curated, and surfaced from the cheatsheet) — never both, never neither.
 
 ### Curation
 
 `CheatsheetService.update_cheatsheet` runs one LLM call per eligible exchange:
 
-1. Load current `chat.cheatsheet` JSON (or `{}` if empty)
-2. LLM call with `[user_query, agent_response, current_cheatsheet]` → updated cheatsheet JSON
-3. Parse and validate with `parse_cheatsheet`; if unparseable, keep previous cheatsheet
-4. Stamp stable `id` on new `key_facts` and `lessons_learned` entries (`kf_*`, `ll_*`)
-5. Stamp `record_id` on all new entries; existing entries carry their `record_id` forward
-6. Save via `project_service.save_chat_cheatsheet`
-7. Advance `cheatsheet_cursor_ts`
+1. Load the current cheatsheet via `DynamicCheatsheet.load`. It is handed to the curator as the raw storage JSON (`to_storage_json`) so the curator can see existing `record_id`s for conflict detection and carry entries forward; a legacy plain-text cheatsheet is passed as-is, an empty cheatsheet as `{}`.
+2. LLM call (`DynamicCheatsheet.curate`) with `[[QUESTION]]`, `[[MODEL_ANSWER]]`, `[[PREVIOUS_CHEATSHEET]]` substituted into the curator prompt → response with the new cheatsheet wrapped in `<cheatsheet>…</cheatsheet>` tags, extracted by `extract_cheatsheet`.
+3. Parse with `parse_cheatsheet`. If the output was unparseable JSON it comes back as `legacy_text` — log an error and keep the previous cheatsheet unchanged.
+4. Stamp stable `id` on new `key_facts` and `lessons_learned` entries (`kf_*`, `ll_*`); `data_insights` get no `id` (keyed by entity + metric).
+5. Stamp `record_id` on every new entry; existing entries keep the `record_id` the curator carried forward.
+6. Save via `DynamicCheatsheet.save` → `project_service.update_chat_cheatsheet`.
 
-The curator reads `record.compressed_message or record.message` — it uses the compressor's summary when available.
+The curator reads `record.compressed_message or record.message` — it uses the compressor's summary when available. After the service call returns, `CheatsheetAgent._curate_record` advances `cheatsheet_cursor_ts`; on a curator exception the cursor is advanced anyway so a permanently-failing record can't wedge the chat.
 
 Model: `CONTEXT_MASTER`. Curation requires understanding the full exchange in context of the existing cheatsheet; a reasoning-capable model is appropriate here.
 
@@ -160,14 +176,22 @@ Model: `CONTEXT_MASTER`. Curation requires understanding the full exchange in co
 
 ## Consumption
 
-### `MemoryService.load_long_term_memory`
+There are two read paths, and they differ in one important way — whether tail filtering is applied.
+
+### Sub-agent prompt injection — `CheatsheetService.get_cheatsheet` (tail-filtered)
+
+The sub-agents (`data_insight_agent`, `sme_agent`, `viz_agent`, `report_generator_agent`) call `CheatsheetService.get_cheatsheet` while building their system prompt and append the result under a `CHEATSHEET:` heading. This is the [tail-filtered](#tail-filtering-on-read-the-second-scd2-boundary) path: entries from records still inside the tail window are hidden, because those exchanges are already present verbatim in the raw chat history in the same prompt.
+
+All settled session findings — from turn 1 up to the tail boundary — are available in ~2 KB regardless of session length. Conflicted entries are prefixed `[CONFLICTED]` so the agent knows the value is contested.
+
+### `MemoryService.load_long_term_memory` (not tail-filtered)
 
 ```python
 raw = self._project_service.get_chat_cheatsheet(chat_id)
-result = render_to_markdown(parse_cheatsheet(raw))
+result = render_to_markdown(parse_cheatsheet(raw))  # no min_record_id
 ```
 
-Rendered as markdown and injected into every system prompt. All session findings — from turn 1 to the current turn — are available to the agent in ~2 KB regardless of session length. Conflicted entries are prefixed `[CONFLICTED]` so the agent knows the value is contested.
+Renders the full cheatsheet — including tail-window entries — with no `min_record_id`. Returns `None` on an empty or `(empty)` cheatsheet.
 
 ### `ConsolidationAgent`
 
@@ -183,4 +207,4 @@ The cheatsheet is the only input `ConsolidationAgent` reads — no direct access
 
 ### `tool_read_long_term_memory`
 
-On-demand tool available during agent reasoning. Returns the same `render_to_markdown` output as `load_long_term_memory`. Used when an agent needs to re-check session findings mid-chain without relying on what was injected at prompt build time.
+On-demand tool (`project_memory_toolbox`) available during agent reasoning. Renders the full cheatsheet with `render_to_markdown(parse_cheatsheet(raw))` — like `load_long_term_memory`, it is **not** tail-filtered. Used when an agent needs to re-check session findings mid-chain without relying on what was injected at prompt build time.
