@@ -114,39 +114,41 @@ flowchart TD
 
 ### Tail window
 
-The cheatsheet is a curated summary, not a log. Curating every exchange as it arrives would produce a cheatsheet biased toward the most recent turn and miss the broader pattern. The tail window defers curation of recent exchanges until enough context has accumulated.
+The cheatsheet is a curated summary, not a log. Curating an exchange the moment it arrives is wasted work: it is still present verbatim in the LLM's raw chat history, and the [injection side hides its cheatsheet entries anyway](#tail-filtering-on-read-the-second-scd2-boundary) while it sits in the tail. So curation is deferred until a record leaves the tail.
+
+This is **one rule**, plus a completeness fallback:
+
+> **Curate a record once it leaves the tail** — i.e. once `tail_n` newer responses exist after it (`unprocessed > tail_n`).
+
+A young or still-accumulating chat is not a special case — it simply has nothing outside the tail yet, the empty case of the same rule. There are no separate "phases".
 
 ```mermaid
 flowchart TD
-    A["_get_next_record\ntail_n = tail_window_size"] --> B["fetch oldest tail_n+1\nunprocessed AGENT RESPONSE records"]
+    A["_get_next_record\ntail_n = TAIL_WINDOW_SIZE"] --> B["fetch oldest tail_n+1\nunprocessed AGENT RESPONSE records"]
     B --> C{unprocessed\ncount > tail_n?}
-    C -- Yes --> PHASE3["Phase 3 — sliding window\noldest has left the tail\ncurate immediately"]
-
-    C -- No --> D["fetch most recent tail_n+1\nall AGENT RESPONSE records"]
-    D --> E{total\n<= tail_n?}
-    E -- Yes --> PHASE1["Phase 1 — young chat\ncurate immediately"]
-
-    E -- No --> F{idle >\n40 min?}
-    F -- Yes --> IDLE["Idle bypass\nflush remaining tail"]
-    F -- No --> PHASE2["Phase 2 — accumulating\ndefer until tail fills"]
+    C -- Yes --> CURATE["oldest unprocessed has left the tail\ncurate it now"]
+    C -- No --> D{idle >\n40 min?}
+    D -- Yes --> IDLE["Completeness fallback\nflush remaining tail"]
+    D -- No --> DEFER["nothing outside the tail yet\ndefer (return None)"]
 ```
 
-| Phase | Condition | Action |
+| Case | Condition | Action |
 |---|---|---|
-| **1 — young** | total records ≤ `tail_n` | Curate each exchange immediately |
-| **2 — accumulating** | total > `tail_n`, unprocessed ≤ `tail_n` | Defer — wait for the tail to fill |
-| **3 — sliding window** | unprocessed > `tail_n` | Oldest unprocessed has left the tail — curate immediately |
-| **Idle bypass** | last response > 40 min ago | Flush all remaining tail records regardless of phase |
+| **Outside the tail** | `unprocessed > tail_n` | Oldest unprocessed has left the tail — curate it now |
+| **Inside the tail** | `unprocessed ≤ tail_n` | Defer — still covered by raw chat history |
+| **Completeness fallback** | `unprocessed ≤ tail_n` and last response > 40 min ago | Flush the remaining tail |
+
+The completeness fallback exists because a chat that ends with `≤ tail_n` trailing records would otherwise leave them inside the tail forever, never curated. After `IDLE_BYPASS_THRESHOLD` (40 min) of inactivity the remaining tail is flushed so the cheatsheet is complete.
 
 `tail_n` is fixed at **6** by the `TAIL_WINDOW_SIZE` constant in `cheatsheet_service.py`. This is a single source of truth, **not** an agent-config knob: the curation side (`CheatsheetAgent`) and the injection side (`CheatsheetService.get_cheatsheet`) must use the same boundary, and the consumers that inject the cheatsheet build their own `CheatsheetService` and cannot see the agent's config. The agent imports the constant rather than defining its own copy.
 
-The 40-minute idle bypass is what allows `ConsolidationAgent` (which fires at 60 minutes idle) to always read a fully settled cheatsheet.
+The 40-minute idle flush is also what lets `ConsolidationAgent` (which fires at 60 minutes idle) always read a fully settled cheatsheet.
 
 ### Tail filtering on read (the second SCD2 boundary)
 
 The tail window has two matched halves around the same `TAIL_WINDOW_SIZE` boundary:
 
-- **Curation side** — `CheatsheetAgent` leaves the most recent `TAIL_WINDOW_SIZE` agent responses uncurated (the phases above).
+- **Curation side** — `CheatsheetAgent` leaves the most recent `TAIL_WINDOW_SIZE` agent responses uncurated (the one rule above).
 - **Injection side** — when the cheatsheet is rendered for context, entries distilled from those same recent records are hidden, because those exchanges are still present verbatim in the raw chat history already in the prompt. Surfacing them again would duplicate signal.
 
 The mechanism: `CheatsheetService.get_cheatsheet` computes `_get_tail_start_record_id(chat_id)` — the oldest `record_id` among the last `TAIL_WINDOW_SIZE` agent RESPONSE records — and passes it to `DynamicCheatsheet.consult` as `min_record_id`. `render_to_markdown` then drops any entry whose `record_id >= min_record_id`. Entries with no `record_id` (e.g. legacy or unstamped) are always shown.
